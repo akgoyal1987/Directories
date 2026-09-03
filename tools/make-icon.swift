@@ -1,4 +1,4 @@
-// Generates Lantern's app icon as an .iconset, which build.sh feeds to iconutil.
+// Generates the app icon as an .iconset, which build.sh feeds to iconutil.
 //
 // The icon is drawn in code rather than checked in as binary art, so it stays
 // diffable, restyles in one place, and needs no design tool to rebuild.
@@ -16,7 +16,7 @@ enum Variant: Int, CaseIterable {
     case panes = 1       // the app's own layout: sidebar plus a list of rows
     case magnify = 2     // a folder under a magnifier
     case stack = 3       // folders receding into depth, the front one lit
-    case lanternLit = 4  // an actual lantern throwing light onto a folder
+    case lampLit = 4     // a lamp throwing light onto a folder
     case drawer = 5      // a filing drawer pulled open, light spilling out
     case openFolder = 6  // an open folder with documents rising from it
 
@@ -25,7 +25,7 @@ enum Variant: Int, CaseIterable {
         case .panes:      return "panes"
         case .magnify:    return "magnify"
         case .stack:      return "stack"
-        case .lanternLit: return "lantern-lit"
+        case .lampLit: return "lamp-lit"
         case .drawer:     return "drawer"
         case .openFolder: return "open-folder"
         }
@@ -139,8 +139,8 @@ func draw(size: CGFloat, variant: Variant) -> NSBitmapImageRep {
         folder(30, 32, 40, 28, 3.5, rgb(226, 160, 40))
         folder(25, 43, 48, 30, 4, amber)
 
-    case .lanternLit:
-        // The name, literally: a lantern above, a folder in its light.
+    case .lampLit:
+        // A lamp above, a folder lit beneath it.
         ctx.saveGState()
         let cone = CGMutablePath()
         cone.move(to: P(43, 40)); cone.addLine(to: P(20, 78))
@@ -154,7 +154,7 @@ func draw(size: CGFloat, variant: Variant) -> NSBitmapImageRep {
                        locations: [0, 1])!,
             start: P(50, 40), end: P(50, 80), options: [])
         ctx.restoreGState()
-        // Lantern: handle, cap, glowing body.
+        // Lamp: handle, cap, glowing body.
         ctx.setStrokeColor(amberBright.cgColor)
         ctx.setLineWidth(2.6 * s); ctx.setLineCap(.round)
         ctx.addArc(center: P(50, 22), radius: 6 * s, startAngle: .pi, endAngle: 0, clockwise: false)
@@ -212,7 +212,7 @@ if args.count > 2, args[1] == "--preview" {
     exit(0)
 }
 
-let outDir = args.count > 1 ? args[1] : "./Lantern.iconset"
+let outDir = args.count > 1 ? args[1] : "./Directories.iconset"
 let variant = Variant(rawValue: args.count > 2 ? Int(args[2]) ?? 1 : 1) ?? .panes
 try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
 

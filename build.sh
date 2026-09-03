@@ -1,12 +1,12 @@
 #!/bin/bash
-# Build Lantern.app. Pass --install to place it in /Applications and launch it.
+# Build Directories.app. Pass --install to place it in /Applications and launch it.
 #
 # The icon is generated from tools/make-icon.swift on every build, so it is kept
 # as source rather than as a checked-in binary.
 set -euo pipefail
 
-NAME="Lantern"
-BUNDLE_ID="com.ankitgoyal.lantern"
+NAME="Directories"
+BUNDLE_ID="com.ankitgoyal.directories"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${HERE}/build/${NAME}.app"
 ICONSET="${HERE}/build/${NAME}.iconset"
@@ -17,7 +17,7 @@ mkdir -p "${OUT}/Contents/MacOS" "${OUT}/Contents/Resources"
 echo "Generating icon..."
 # Icon variant, by number. Run this to see them all before changing it:
 #   swift tools/make-icon.swift --preview /tmp/variants.png
-# 1 panes  2 magnify  3 stack  4 lantern-lit  5 drawer  6 open-folder
+# 1 panes  2 magnify  3 stack  4 lamp-lit  5 drawer  6 open-folder
 ICON_VARIANT=2
 swift "${HERE}/tools/make-icon.swift" "${ICONSET}" "${ICON_VARIANT}" >/dev/null
 iconutil --convert icns "${ICONSET}" --output "${OUT}/Contents/Resources/AppIcon.icns"

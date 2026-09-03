@@ -1,4 +1,4 @@
-// Lantern - a Windows-Explorer-style file navigator for macOS.
+// Directories - a Windows-Explorer-style file navigator for macOS.
 //
 // Left: an expandable folder tree. Right: folder contents as a list or icon grid.
 // Tabs with per-tab history, an editable address bar, live filtering, and a
@@ -1363,7 +1363,7 @@ struct ContentView: View {
         .sheet(isPresented: Binding(
             get: { state.opRunning }, set: { if !$0 { state.cancelOperation() } }
         )) { TransferSheet() }
-        .alert("Lantern", isPresented: Binding(
+        .alert("Directories", isPresented: Binding(
             get: { state.errorText != nil },
             set: { if !$0 { state.errorText = nil } }
         )) {
@@ -1677,12 +1677,12 @@ struct AppCommands: Commands {
 }
 
 @main
-struct LanternApp: App {
+struct DirectoriesApp: App {
     @StateObject private var state = AppState()
     @StateObject private var layout = ColumnLayout()
 
     var body: some Scene {
-        WindowGroup("Lantern") {
+        WindowGroup("Directories") {
             ContentView()
                 .environmentObject(state)
                 .environmentObject(layout)
