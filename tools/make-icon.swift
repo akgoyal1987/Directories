@@ -1,23 +1,54 @@
-// Generates Arbor's app icon as an .iconset, which build.sh feeds to iconutil.
+// Generates Lantern's app icon as an .iconset, which build.sh feeds to iconutil.
 //
 // The icon is drawn in code rather than checked in as binary art, so it stays
 // diffable, restyles in one place, and needs no design tool to rebuild.
 //
-//   swift tools/make-icon.swift <output.iconset directory>
+//   swift tools/make-icon.swift <output.iconset directory> [variant]
+//   swift tools/make-icon.swift --preview <out.png>     # all variants side by side
 //
-// Motif: a folder branching into three child nodes - the tree view that is the
-// point of the app. Emerald-to-teal, to sit apart from Finder's blue.
+// The mark is an "L" monogram rather than a pictogram.
 
 import AppKit
 
-let outDir = CommandLine.arguments.count > 1
-    ? CommandLine.arguments[1]
-    : "./Arbor.iconset"
+enum Variant: Int, CaseIterable {
+    case warm = 1      // white L on a warm amber gradient
+    case night = 2     // amber L glowing out of a deep navy ground
+    case outline = 3   // hollow stroked L on amber
+    case graphite = 4  // amber L on graphite, understated
 
-try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+    var name: String {
+        switch self {
+        case .warm: return "warm"
+        case .night: return "night"
+        case .outline: return "outline"
+        case .graphite: return "graphite"
+        }
+    }
+}
 
-// Art is authored in a 100x100 space and scaled to each output size.
-func draw(size: CGFloat) -> NSBitmapImageRep {
+func rgb(_ r: Int, _ g: Int, _ b: Int) -> NSColor {
+    NSColor(srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1)
+}
+
+func plateColors(_ v: Variant) -> (NSColor, NSColor) {
+    switch v {
+    case .warm:     return (rgb(255, 196, 107), rgb(217, 119, 6))
+    case .night:    return (rgb(40, 58, 86),    rgb(11, 18, 32))
+    case .outline:  return (rgb(251, 176, 59),  rgb(180, 83, 9))
+    case .graphite: return (rgb(90, 90, 100),   rgb(24, 24, 27))
+    }
+}
+
+func letterColor(_ v: Variant) -> NSColor {
+    switch v {
+    case .warm:     return .white
+    case .night:    return rgb(251, 191, 36)
+    case .outline:  return .white
+    case .graphite: return rgb(252, 211, 77)
+    }
+}
+
+func draw(size: CGFloat, variant: Variant) -> NSBitmapImageRep {
     let px = Int(size)
     let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
                                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
@@ -28,113 +59,128 @@ func draw(size: CGFloat) -> NSBitmapImageRep {
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
     let ctx = NSGraphicsContext.current!.cgContext
-    let s = size / 100.0                      // one unit of the 100x100 space
+    let s = size / 100.0                      // one unit of a 100x100 space
 
     // macOS icons leave a margin: the art occupies roughly 80% of the canvas.
     let inset: CGFloat = 10
     let plate = CGRect(x: inset * s, y: inset * s,
                        width: (100 - inset * 2) * s, height: (100 - inset * 2) * s)
     let corner = plate.width * 0.2237         // the system's squircle proportion
-
-    // Rounded plate with a vertical gradient.
     let platePath = CGPath(roundedRect: plate, cornerWidth: corner, cornerHeight: corner,
                            transform: nil)
+
     ctx.saveGState()
     ctx.addPath(platePath)
     ctx.clip()
-    let colors = [
-        NSColor(srgbRed: 0.204, green: 0.827, blue: 0.600, alpha: 1).cgColor,  // emerald
-        NSColor(srgbRed: 0.020, green: 0.435, blue: 0.427, alpha: 1).cgColor,  // teal
-    ] as CFArray
+
+    let (top, bottom) = plateColors(variant)
     let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                              colors: colors, locations: [0, 1])!
+                              colors: [top.cgColor, bottom.cgColor] as CFArray,
+                              locations: [0, 1])!
     ctx.drawLinearGradient(gradient,
                            start: CGPoint(x: plate.midX, y: plate.maxY),
                            end: CGPoint(x: plate.midX, y: plate.minY),
                            options: [])
-    ctx.restoreGState()
 
-    // A soft top highlight so the plate reads as a surface, not a flat swatch.
-    // This has to fade out - a flat fill leaves a hard seam across the middle.
-    ctx.saveGState()
-    ctx.addPath(platePath)
-    ctx.clip()
-    let sheenColors = [
-        NSColor(white: 1, alpha: 0.18).cgColor,
-        NSColor(white: 1, alpha: 0.0).cgColor,
-    ] as CFArray
+    // A soft top sheen, faded out so it leaves no seam across the middle.
     let sheen = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                           colors: sheenColors, locations: [0, 1])!
+                           colors: [NSColor(white: 1, alpha: 0.16).cgColor,
+                                    NSColor(white: 1, alpha: 0.0).cgColor] as CFArray,
+                           locations: [0, 1])!
     ctx.drawLinearGradient(sheen,
                            start: CGPoint(x: plate.midX, y: plate.maxY),
                            end: CGPoint(x: plate.midX, y: plate.midY),
                            options: [])
+
+    // The name earns a glow: a warm pool of light behind the letter.
+    if variant == .night {
+        let glow = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                              colors: [NSColor(srgbRed: 1, green: 0.79, blue: 0.30, alpha: 0.40).cgColor,
+                                       NSColor(srgbRed: 1, green: 0.79, blue: 0.30, alpha: 0.0).cgColor] as CFArray,
+                              locations: [0, 1])!
+        ctx.drawRadialGradient(glow,
+                               startCenter: CGPoint(x: plate.midX, y: plate.midY), startRadius: 0,
+                               endCenter: CGPoint(x: plate.midX, y: plate.midY),
+                               endRadius: plate.width * 0.52,
+                               options: [])
+    }
     ctx.restoreGState()
 
-    // ---- the tree ----
-    // Flip to a top-left origin, which is easier to reason about for layout.
-    func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x * s, y: (100 - y) * s) }
-
-    let white = NSColor.white.cgColor
-    let line = NSColor(white: 1, alpha: 0.92).cgColor
-
-    // Parent folder, top left.
-    let folder = CGRect(x: 24 * s, y: (100 - 36) * s, width: 22 * s, height: 16 * s)
-    let tab = CGRect(x: 24 * s, y: (100 - 22) * s, width: 10 * s, height: 4 * s)
-    ctx.setFillColor(white)
-    ctx.addPath(CGPath(roundedRect: tab, cornerWidth: 1.6 * s, cornerHeight: 1.6 * s, transform: nil))
-    ctx.fillPath()
-    ctx.addPath(CGPath(roundedRect: folder, cornerWidth: 3 * s, cornerHeight: 3 * s, transform: nil))
-    ctx.fillPath()
-
-    // Trunk and three branches into child nodes.
-    let trunkX: CGFloat = 33
-    let branchTo: CGFloat = 53
-    let rows: [CGFloat] = [50, 65, 80]
-
-    ctx.setStrokeColor(line)
-    ctx.setLineWidth(3.4 * s)
-    ctx.setLineCap(.round)
-
-    ctx.move(to: p(trunkX, 38))
-    ctx.addLine(to: p(trunkX, rows.last!))
-    ctx.strokePath()
-
-    for row in rows {
-        ctx.move(to: p(trunkX, row))
-        ctx.addLine(to: p(branchTo, row))
-        ctx.strokePath()
-    }
-
-    // Child nodes as rounded tiles.
-    ctx.setFillColor(white)
-    for row in rows {
-        let node = CGRect(x: 56 * s, y: (100 - row - 5.5) * s, width: 20 * s, height: 11 * s)
-        ctx.addPath(CGPath(roundedRect: node, cornerWidth: 2.6 * s, cornerHeight: 2.6 * s,
-                           transform: nil))
-        ctx.fillPath()
+    // ---- the monogram ----
+    // Centre on the glyph outline, not the text line box: a line box carries
+    // ascender and descender space the "L" does not use, which pushes it high
+    // enough to clip the plate.
+    let uiFont = NSFont.systemFont(ofSize: 100, weight: .black)
+    let ctFont = uiFont as CTFont
+    var chars: [UniChar] = Array("L".utf16)
+    var glyphs = [CGGlyph](repeating: 0, count: chars.count)
+    if CTFontGetGlyphsForCharacters(ctFont, &chars, &glyphs, chars.count),
+       let glyph = CTFontCreatePathForGlyph(ctFont, glyphs[0], nil) {
+        let box = glyph.boundingBox
+        let targetHeight = 44 * s
+        let scale = targetHeight / box.height
+        var transform = CGAffineTransform.identity
+            .translatedBy(x: plate.midX - box.midX * scale,
+                          y: plate.midY - box.midY * scale)
+            .scaledBy(x: scale, y: scale)
+        if let placed = glyph.copy(using: &transform) {
+            ctx.addPath(placed)
+            if variant == .outline {
+                ctx.setStrokeColor(letterColor(variant).cgColor)
+                ctx.setLineWidth(4.5 * s)
+                ctx.setLineJoin(.round)
+                ctx.strokePath()
+            } else {
+                ctx.setFillColor(letterColor(variant).cgColor)
+                ctx.fillPath()
+            }
+        }
     }
 
     NSGraphicsContext.restoreGraphicsState()
     return rep
 }
 
-func write(_ rep: NSBitmapImageRep, _ name: String) {
-    guard let data = rep.representation(using: .png, properties: [:]) else { return }
-    try? data.write(to: URL(fileURLWithPath: "\(outDir)/\(name)"))
+func png(_ rep: NSBitmapImageRep) -> Data? { rep.representation(using: .png, properties: [:]) }
+
+let args = CommandLine.arguments
+
+// ---- preview mode: every variant on one strip, for choosing ----
+if args.count > 2, args[1] == "--preview" {
+    let tile: CGFloat = 256
+    let all = Variant.allCases
+    let sheet = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                 pixelsWide: Int(tile) * all.count, pixelsHigh: Int(tile),
+                                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                 isPlanar: false, colorSpaceName: .deviceRGB,
+                                 bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: sheet)
+    for (i, v) in all.enumerated() {
+        let rep = draw(size: tile, variant: v)
+        rep.draw(in: NSRect(x: CGFloat(i) * tile, y: 0, width: tile, height: tile))
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try? png(sheet)?.write(to: URL(fileURLWithPath: args[2]))
+    print("Preview written to \(args[2]): " + all.map(\.name).joined(separator: ", "))
+    exit(0)
 }
 
-// The set macOS expects in an .iconset.
-let variants: [(Int, String)] = [
+// ---- normal mode: one variant, full iconset ----
+let outDir = args.count > 1 ? args[1] : "./Lantern.iconset"
+let variant = Variant(rawValue: args.count > 2 ? Int(args[2]) ?? 1 : 1) ?? .warm
+try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+
+let sizes: [(Int, String)] = [
     (16, "icon_16x16.png"),     (32, "icon_16x16@2x.png"),
     (32, "icon_32x32.png"),     (64, "icon_32x32@2x.png"),
     (128, "icon_128x128.png"),  (256, "icon_128x128@2x.png"),
     (256, "icon_256x256.png"),  (512, "icon_256x256@2x.png"),
     (512, "icon_512x512.png"),  (1024, "icon_512x512@2x.png"),
 ]
-
-for (size, name) in variants {
-    write(draw(size: CGFloat(size)), name)
+for (size, name) in sizes {
+    if let data = png(draw(size: CGFloat(size), variant: variant)) {
+        try? data.write(to: URL(fileURLWithPath: "\(outDir)/\(name)"))
+    }
 }
-
-print("Wrote \(variants.count) icon sizes to \(outDir)")
+print("Wrote \(sizes.count) sizes to \(outDir) using variant \(variant.name)")

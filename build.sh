@@ -1,12 +1,12 @@
 #!/bin/bash
-# Build Arbor.app. Pass --install to place it in /Applications and launch it.
+# Build Lantern.app. Pass --install to place it in /Applications and launch it.
 #
 # The icon is generated from tools/make-icon.swift on every build, so it is kept
 # as source rather than as a checked-in binary.
 set -euo pipefail
 
-NAME="Arbor"
-BUNDLE_ID="com.ankitgoyal.arbor"
+NAME="Lantern"
+BUNDLE_ID="com.ankitgoyal.lantern"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${HERE}/build/${NAME}.app"
 ICONSET="${HERE}/build/${NAME}.iconset"
@@ -15,7 +15,8 @@ rm -rf "${OUT}" "${ICONSET}"
 mkdir -p "${OUT}/Contents/MacOS" "${OUT}/Contents/Resources"
 
 echo "Generating icon..."
-swift "${HERE}/tools/make-icon.swift" "${ICONSET}" >/dev/null
+# Variant 2 = "night": an amber monogram glowing out of a deep navy plate.
+swift "${HERE}/tools/make-icon.swift" "${ICONSET}" 2 >/dev/null
 iconutil --convert icns "${ICONSET}" --output "${OUT}/Contents/Resources/AppIcon.icns"
 
 cat > "${OUT}/Contents/Info.plist" <<PLIST
