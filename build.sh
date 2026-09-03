@@ -54,6 +54,9 @@ if [[ "${1:-}" == "--install" ]]; then
     # Nudge Launch Services so the new icon shows immediately.
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
         -f "/Applications/${NAME}.app" 2>/dev/null || true
+    # Remove the staging copy: two identical bundles both get indexed by
+    # Spotlight, so searching the app name offers a stale duplicate.
+    rm -rf "${OUT}" "${ICONSET}"
     echo "Installed to /Applications/${NAME}.app"
     open "/Applications/${NAME}.app"
 fi
