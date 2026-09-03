@@ -112,11 +112,17 @@ enum ViewMode: String, CaseIterable, Codable {
 final class FileNode: ObservableObject, Identifiable, Hashable {
     let url: URL
     let name: String
-    var id: URL { url }
+    let id = UUID()          // per instance: the same path can appear in two sections
 
     @Published var children: [FileNode] = []
     @Published var isExpanded = false {
-        didSet { if isExpanded && !loaded { load() } }
+        didSet {
+            guard isExpanded, !loaded else { return }
+            // Reassigning children synchronously here mutates state SwiftUI is
+            // in the middle of reading, which duplicates rows. Defer one tick.
+            loaded = true
+            DispatchQueue.main.async { [weak self] in self?.populate() }
+        }
     }
     private var loaded = false
 
@@ -127,6 +133,10 @@ final class FileNode: ObservableObject, Identifiable, Hashable {
 
     func load() {
         loaded = true
+        populate()
+    }
+
+    private func populate() {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .localizedNameKey]
         let items = (try? FileManager.default.contentsOfDirectory(
             at: url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
@@ -137,10 +147,8 @@ final class FileNode: ObservableObject, Identifiable, Hashable {
     }
 
     func reload() {
-        let wasExpanded = isExpanded
-        loaded = false
-        load()
-        isExpanded = wasExpanded
+        loaded = true
+        populate()
     }
 
     /// Expand down to a path so navigating on the right reveals the folder on the left.
@@ -152,8 +160,8 @@ final class FileNode: ObservableObject, Identifiable, Hashable {
         for child in children { child.reveal(target) }
     }
 
-    static func == (a: FileNode, b: FileNode) -> Bool { a.url == b.url }
-    func hash(into hasher: inout Hasher) { hasher.combine(url) }
+    static func == (a: FileNode, b: FileNode) -> Bool { a === b }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 // MARK: - List model
@@ -163,6 +171,7 @@ struct Entry: Identifiable, Hashable {
     var id: URL { url }
     let name: String
     let isFolder: Bool      // navigable directory; bundles count as files
+    let isBundle: Bool      // .app and friends: a directory, so it has no own size
     let size: Int64
     let modified: Date
     let created: Date
@@ -174,7 +183,9 @@ struct Entry: Identifiable, Hashable {
 
     func text(for column: Column) -> String {
         switch column {
-        case .size:        return isFolder ? "--" : ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+        case .size:        return (isFolder || isBundle)
+                                ? "--"
+                                : ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
         case .kind:        return kind
         case .modified:    return modified.formatted(date: .abbreviated, time: .shortened)
         case .created:     return created == .distantPast ? "--" : created.formatted(date: .abbreviated, time: .shortened)
@@ -213,6 +224,7 @@ func readEntries(_ folder: URL, showHidden: Bool, posix: Bool) -> [Entry] {
         return Entry(url: url,
                      name: v?.localizedName ?? url.lastPathComponent,
                      isFolder: isDir && !isPkg,
+                     isBundle: isPkg,
                      size: Int64(v?.fileSize ?? 0),
                      modified: v?.contentModificationDate ?? .distantPast,
                      created: v?.creationDate ?? .distantPast,
@@ -1058,7 +1070,7 @@ struct ContentView: View {
             Text("\(state.rows.count) item\(state.rows.count == 1 ? "" : "s")")
             if !state.selected.isEmpty {
                 Text("\(state.selected.count) selected")
-                let bytes = state.selectedEntries.filter { !$0.isFolder }.reduce(Int64(0)) { $0 + $1.size }
+                let bytes = state.selectedEntries.filter { !$0.isFolder && !$0.isBundle }.reduce(Int64(0)) { $0 + $1.size }
                 if bytes > 0 { Text(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) }
             }
             Spacer()
@@ -1094,7 +1106,7 @@ struct InfoSheet: View {
             Divider()
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 7) {
                 row("Where", entry.url.deletingLastPathComponent().path)
-                row("Size", entry.isFolder ? "--"
+                row("Size", (entry.isFolder || entry.isBundle) ? "--"
                     : ByteCountFormatter.string(fromByteCount: entry.size, countStyle: .file))
                 row("Modified", entry.modified.formatted(date: .long, time: .standard))
                 if entry.created != .distantPast {
