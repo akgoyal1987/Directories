@@ -1,7 +1,8 @@
-// TreeFiles - a Windows-Explorer-style file navigator for macOS.
+// Arbor - a Windows-Explorer-style file navigator for macOS.
 //
 // Left: an expandable folder tree. Right: folder contents as a list or icon grid.
-// Tabs with per-tab history, an editable address bar, live filtering, sorting.
+// Tabs with per-tab history, an editable address bar, live filtering, and a
+// configurable set of resizable, sortable columns.
 //
 // Where macOS already provides something, it is used rather than reimplemented:
 // Quick Look for previews, NSWorkspace for icons and "Open With", ShareLink for
@@ -30,9 +31,78 @@ enum FS {
         return v?.localizedName ?? url.lastPathComponent
     }
 
-    static func icon(_ url: URL) -> NSImage {
-        NSWorkspace.shared.icon(forFile: url.path)
+    static func icon(_ url: URL) -> NSImage { NSWorkspace.shared.icon(forFile: url.path) }
+
+    /// "rwxr-xr-x" from a POSIX mode.
+    static func permissionString(_ mode: Int) -> String {
+        let bits = ["r", "w", "x"]
+        return (0..<9).map { i in
+            (mode & (1 << (8 - i))) != 0 ? bits[i % 3] : "-"
+        }.joined()
     }
+}
+
+// MARK: - Columns
+
+enum Column: String, CaseIterable, Codable {
+    case size, kind, modified, created, added, ext, owner, permissions
+
+    var label: String {
+        switch self {
+        case .size:        return "Size"
+        case .kind:        return "Kind"
+        case .modified:    return "Date Modified"
+        case .created:     return "Date Created"
+        case .added:       return "Date Added"
+        case .ext:         return "Extension"
+        case .owner:       return "Owner"
+        case .permissions: return "Permissions"
+        }
+    }
+
+    var defaultWidth: CGFloat {
+        switch self {
+        case .size:        return 82
+        case .kind:        return 130
+        case .modified:    return 150
+        case .created:     return 150
+        case .added:       return 150
+        case .ext:         return 80
+        case .owner:       return 100
+        case .permissions: return 100
+        }
+    }
+
+    var minWidth: CGFloat { 54 }
+
+    var trailing: Bool {
+        switch self {
+        case .size, .modified, .created, .added: return true
+        default: return false
+        }
+    }
+
+    /// Owner and permissions need a stat() per file, so they are only read when shown.
+    var needsPOSIX: Bool { self == .owner || self == .permissions }
+}
+
+/// Name is always present and always first, so it is not part of `Column`.
+enum SortField: Hashable {
+    case name
+    case column(Column)
+
+    var label: String {
+        switch self {
+        case .name: return "Name"
+        case .column(let c): return c.label
+        }
+    }
+}
+
+enum ViewMode: String, CaseIterable, Codable {
+    case list, icons
+    var label: String { self == .list ? "List" : "Icons" }
+    var symbol: String { self == .list ? "list.bullet" : "square.grid.2x2" }
 }
 
 // MARK: - Tree model
@@ -95,54 +165,80 @@ struct Entry: Identifiable, Hashable {
     let isFolder: Bool      // navigable directory; bundles count as files
     let size: Int64
     let modified: Date
+    let created: Date
+    let added: Date
     let kind: String
-}
+    let ext: String
+    let owner: String
+    let permissions: String
 
-enum SortKey: String, CaseIterable {
-    case name, size, kind, modified
-    var label: String {
-        switch self {
-        case .name: return "Name"
-        case .size: return "Size"
-        case .kind: return "Kind"
-        case .modified: return "Date Modified"
+    func text(for column: Column) -> String {
+        switch column {
+        case .size:        return isFolder ? "--" : ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+        case .kind:        return kind
+        case .modified:    return modified.formatted(date: .abbreviated, time: .shortened)
+        case .created:     return created == .distantPast ? "--" : created.formatted(date: .abbreviated, time: .shortened)
+        case .added:       return added == .distantPast ? "--" : added.formatted(date: .abbreviated, time: .shortened)
+        case .ext:         return ext.isEmpty ? "--" : ext
+        case .owner:       return owner
+        case .permissions: return permissions
         }
     }
 }
 
-enum ViewMode: String, CaseIterable {
-    case list, icons
-    var label: String { self == .list ? "List" : "Icons" }
-    var symbol: String { self == .list ? "list.bullet" : "square.grid.2x2" }
-}
-
-func readEntries(_ folder: URL, showHidden: Bool) -> [Entry] {
+func readEntries(_ folder: URL, showHidden: Bool, posix: Bool) -> [Entry] {
     let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .fileSizeKey,
-                                  .contentModificationDateKey, .localizedNameKey,
+                                  .contentModificationDateKey, .creationDateKey,
+                                  .addedToDirectoryDateKey, .localizedNameKey,
                                   .localizedTypeDescriptionKey]
     let opts: FileManager.DirectoryEnumerationOptions = showHidden ? [] : [.skipsHiddenFiles]
     let items = (try? FileManager.default.contentsOfDirectory(
         at: folder, includingPropertiesForKeys: keys, options: opts)) ?? []
+
     return items.map { url in
         let v = try? url.resourceValues(forKeys: Set(keys))
         let isDir = v?.isDirectory ?? false
         let isPkg = v?.isPackage ?? false
+
+        // A stat() per file is too expensive to do unless a column needs it.
+        var owner = ""
+        var perms = ""
+        if posix, let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
+            owner = attrs[.ownerAccountName] as? String ?? ""
+            if let mode = attrs[.posixPermissions] as? NSNumber {
+                perms = FS.permissionString(mode.intValue)
+            }
+        }
+
         return Entry(url: url,
                      name: v?.localizedName ?? url.lastPathComponent,
                      isFolder: isDir && !isPkg,
                      size: Int64(v?.fileSize ?? 0),
                      modified: v?.contentModificationDate ?? .distantPast,
-                     kind: v?.localizedTypeDescription ?? "")
+                     created: v?.creationDate ?? .distantPast,
+                     added: v?.addedToDirectoryDate ?? .distantPast,
+                     kind: v?.localizedTypeDescription ?? "",
+                     ext: url.pathExtension,
+                     owner: owner,
+                     permissions: perms)
     }
 }
 
-func sortEntries(_ list: [Entry], by key: SortKey, ascending: Bool) -> [Entry] {
+func sortEntries(_ list: [Entry], by field: SortField, ascending: Bool) -> [Entry] {
     func before(_ a: Entry, _ b: Entry) -> Bool {
-        switch key {
-        case .name:     return a.name.localizedStandardCompare(b.name) == .orderedAscending
-        case .size:     return a.size < b.size
-        case .kind:     return a.kind.localizedStandardCompare(b.kind) == .orderedAscending
-        case .modified: return a.modified < b.modified
+        switch field {
+        case .name: return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        case .column(let c):
+            switch c {
+            case .size:        return a.size < b.size
+            case .modified:    return a.modified < b.modified
+            case .created:     return a.created < b.created
+            case .added:       return a.added < b.added
+            case .kind:        return a.kind.localizedStandardCompare(b.kind) == .orderedAscending
+            case .ext:         return a.ext.localizedStandardCompare(b.ext) == .orderedAscending
+            case .owner:       return a.owner.localizedStandardCompare(b.owner) == .orderedAscending
+            case .permissions: return a.permissions < b.permissions
+            }
         }
     }
     // Folders always lead, in both sort directions - the Explorer convention.
@@ -186,10 +282,15 @@ final class AppState: ObservableObject {
     @Published private var allRows: [Entry] = []
     @Published var selected: Set<URL> = []
     @Published var filter = ""
-    @Published var sortKey: SortKey = .name
+    @Published var sortField: SortField = .name
     @Published var sortAscending = true
     @Published var viewMode: ViewMode = .list
     @Published var showHidden = false
+
+    /// Visible columns, in display order. Name is implicit and always first.
+    @Published var columns: [Column] = [.size, .kind, .modified]
+    @Published var widths: [Column: CGFloat] = [:]
+    @Published var nameWidth: CGFloat = 300
 
     @Published var addressText = ""
     @Published var focusAddress = false
@@ -203,18 +304,74 @@ final class AppState: ObservableObject {
 
     init() {
         // Inherit the user's last choices rather than resetting every launch.
-        if let raw = defaults.string(forKey: "sortKey"), let k = SortKey(rawValue: raw) { sortKey = k }
         if defaults.object(forKey: "sortAscending") != nil { sortAscending = defaults.bool(forKey: "sortAscending") }
+        if let raw = defaults.string(forKey: "sortColumn") {
+            sortField = raw == "name" ? .name : (Column(rawValue: raw).map(SortField.column) ?? .name)
+        }
         if let raw = defaults.string(forKey: "viewMode"), let m = ViewMode(rawValue: raw) { viewMode = m }
         showHidden = defaults.bool(forKey: "showHidden")
+        if let data = defaults.data(forKey: "columns"),
+           let saved = try? JSONDecoder().decode([Column].self, from: data) {
+            columns = saved
+        }
+        if let data = defaults.data(forKey: "widths"),
+           let saved = try? JSONDecoder().decode([String: CGFloat].self, from: data) {
+            for (k, v) in saved { if let c = Column(rawValue: k) { widths[c] = v } }
+        }
+        nameWidth = defaults.object(forKey: "nameWidth") as? CGFloat ?? 300
     }
 
     private func persist() {
-        defaults.set(sortKey.rawValue, forKey: "sortKey")
+        switch sortField {
+        case .name: defaults.set("name", forKey: "sortColumn")
+        case .column(let c): defaults.set(c.rawValue, forKey: "sortColumn")
+        }
         defaults.set(sortAscending, forKey: "sortAscending")
         defaults.set(viewMode.rawValue, forKey: "viewMode")
         defaults.set(showHidden, forKey: "showHidden")
+        if let data = try? JSONEncoder().encode(columns) { defaults.set(data, forKey: "columns") }
+        var w: [String: CGFloat] = [:]
+        for (k, v) in widths { w[k.rawValue] = v }
+        if let data = try? JSONEncoder().encode(w) { defaults.set(data, forKey: "widths") }
+        defaults.set(nameWidth, forKey: "nameWidth")
     }
+
+    // MARK: columns
+
+    func width(_ column: Column) -> CGFloat { widths[column] ?? column.defaultWidth }
+
+    func setWidth(_ column: Column, _ value: CGFloat) {
+        widths[column] = max(column.minWidth, value)
+    }
+
+    func commitWidths() { persist() }
+
+    func isVisible(_ column: Column) -> Bool { columns.contains(column) }
+
+    func toggleColumn(_ column: Column) {
+        if let i = columns.firstIndex(of: column) {
+            columns.remove(at: i)
+            // Never leave the sort pointing at a hidden column.
+            if case .column(let c) = sortField, c == column { sortField = .name; sortAscending = true }
+        } else {
+            columns.append(column)
+            columns = Column.allCases.filter { columns.contains($0) }   // keep a stable order
+        }
+        persist()
+        refresh()   // owner and permissions need a re-read
+    }
+
+    func resetColumns() {
+        columns = [.size, .kind, .modified]
+        widths = [:]
+        nameWidth = 300
+        persist()
+        refresh()
+    }
+
+    private var needsPOSIX: Bool { columns.contains { $0.needsPOSIX } }
+
+    // MARK: derived
 
     var activeIndex: Int { tabs.firstIndex { $0.id == activeID } ?? 0 }
     var active: Tab? { tabs.indices.contains(activeIndex) ? tabs[activeIndex] : nil }
@@ -224,7 +381,7 @@ final class AppState: ObservableObject {
         let base = filter.isEmpty
             ? allRows
             : allRows.filter { $0.name.localizedCaseInsensitiveContains(filter) }
-        return sortEntries(base, by: sortKey, ascending: sortAscending)
+        return sortEntries(base, by: sortField, ascending: sortAscending)
     }
 
     var selectedEntries: [Entry] { rows.filter { selected.contains($0.url) } }
@@ -263,7 +420,7 @@ final class AppState: ObservableObject {
 
     func refresh() {
         guard let folder else { return }
-        allRows = readEntries(folder, showHidden: showHidden)
+        allRows = readEntries(folder, showHidden: showHidden, posix: needsPOSIX)
         selected = []
         addressText = folder.path
     }
@@ -318,14 +475,10 @@ final class AppState: ObservableObject {
     func openInNewTab(_ url: URL) { newTab(); go(url) }
 
     /// Space bar preview, using the system Quick Look panel.
-    func quickLook() {
-        previewURL = selectedEntries.first?.url
-    }
+    func quickLook() { previewURL = selectedEntries.first?.url }
 
     /// The system's own list of apps that can open this file.
-    func applications(for url: URL) -> [URL] {
-        NSWorkspace.shared.urlsForApplications(toOpen: url)
-    }
+    func applications(for url: URL) -> [URL] { NSWorkspace.shared.urlsForApplications(toOpen: url) }
 
     func open(_ url: URL, with app: URL) {
         NSWorkspace.shared.open([url], withApplicationAt: app,
@@ -353,9 +506,7 @@ final class AppState: ObservableObject {
         NSPasteboard.general.setString(text, forType: .string)
     }
 
-    func copyLocation() {
-        copyToPasteboard(selectedEntries.first?.url.path ?? folder?.path ?? "")
-    }
+    func copyLocation() { copyToPasteboard(selectedEntries.first?.url.path ?? folder?.path ?? "") }
 
     // MARK: recoverable file operations
 
@@ -416,9 +567,7 @@ final class AppState: ObservableObject {
         }
         refresh()
         if let folder { reloadTreeNode(for: folder) }
-        if !failed.isEmpty {
-            errorText = "Could not move to Trash: \(failed.joined(separator: ", "))"
-        }
+        if !failed.isEmpty { errorText = "Could not move to Trash: \(failed.joined(separator: ", "))" }
     }
 
     private func reloadTreeNode(for url: URL) {
@@ -452,15 +601,13 @@ final class AppState: ObservableObject {
         refresh()
     }
 
-    func toggleSort(_ key: SortKey) {
-        if sortKey == key { sortAscending.toggle() } else { sortKey = key; sortAscending = true }
+    func toggleSort(_ field: SortField) {
+        if sortField == field { sortAscending.toggle() } else { sortField = field; sortAscending = true }
         persist()
     }
 
     func setViewMode(_ mode: ViewMode) { viewMode = mode; persist() }
-
     func toggleHidden() { showHidden.toggle(); persist(); refresh() }
-
     func selectAll() { selected = Set(rows.map(\.url)) }
 }
 
@@ -477,8 +624,7 @@ struct TreeRow: View {
             ForEach(node.children) { child in TreeRow(node: child) }
         } label: {
             HStack(spacing: 6) {
-                Image(nsImage: FS.icon(node.url))
-                    .resizable().frame(width: 16, height: 16)
+                Image(nsImage: FS.icon(node.url)).resizable().frame(width: 16, height: 16)
                 Text(node.name).lineLimit(1).font(.system(size: 12.5))
                 Spacer(minLength: 0)
             }
@@ -518,45 +664,58 @@ struct Sidebar: View {
     }
 }
 
-// MARK: - Shared row context menu
+// MARK: - Column chooser
 
-struct EntryMenu: View {
-    let entry: Entry
+struct ColumnMenu: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
-        Button("Open") { state.open(entry) }
-        if entry.isFolder { Button("Open in New Tab") { state.openInNewTab(entry.url) } }
-
-        // The system's own association list, not a hand-maintained one.
-        let apps = state.applications(for: entry.url)
-        if !apps.isEmpty {
-            Menu("Open With") {
-                ForEach(apps, id: \.self) { app in
-                    Button(FS.displayName(app)) { state.open(entry.url, with: app) }
-                }
+        ForEach(Column.allCases, id: \.self) { column in
+            Button {
+                state.toggleColumn(column)
+            } label: {
+                // A leading check mark reads correctly in an AppKit context menu.
+                Text(state.isVisible(column) ? "\u{2713}  \(column.label)" : "     \(column.label)")
             }
         }
         Divider()
-        Button("Quick Look") { state.selected = [entry.url]; state.quickLook() }
-        Button("Get Info") { state.infoTarget = entry }
-        Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([entry.url]) }
-        if entry.isFolder { Button("Open in Terminal") { state.openTerminal(at: entry.url) } }
-        Divider()
-        ShareLink(item: entry.url) { Text("Share") }
-        Button("Rename") { state.selected = [entry.url]; state.beginRename() }
-        Divider()
-        Button("Copy Path") { state.copyToPasteboard(entry.url.path) }
-        Button("Copy Name") { state.copyToPasteboard(entry.name) }
-        Divider()
-        Button("Move to Trash") { state.selected = [entry.url]; state.moveToTrash() }
+        Button("Reset Columns") { state.resetColumns() }
     }
 }
 
-// MARK: - List view
+// MARK: - Header
 
-struct ColumnHeader: View {
-    let key: SortKey
+/// A draggable divider that resizes the column to its left.
+struct ResizeHandle: View {
+    let width: CGFloat
+    let minWidth: CGFloat
+    let onChange: (CGFloat) -> Void
+    let onEnd: () -> Void
+
+    @State private var startWidth: CGFloat?
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.secondary.opacity(0.22))
+            .frame(width: 1)
+            .padding(.horizontal, 3)
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { g in
+                        if startWidth == nil { startWidth = width }
+                        onChange(max(minWidth, (startWidth ?? width) + g.translation.width))
+                    }
+                    .onEnded { _ in startWidth = nil; onEnd() }
+            )
+    }
+}
+
+struct HeaderCell: View {
+    let field: SortField
     let width: CGFloat?
     let trailing: Bool
     @EnvironmentObject var state: AppState
@@ -564,19 +723,45 @@ struct ColumnHeader: View {
     var body: some View {
         HStack(spacing: 3) {
             if trailing { Spacer(minLength: 0) }
-            Text(key.label).font(.system(size: 11, weight: .medium))
-            if state.sortKey == key {
+            Text(field.label).font(.system(size: 11, weight: .medium)).lineLimit(1)
+            if state.sortField == field {
                 Image(systemName: state.sortAscending ? "chevron.up" : "chevron.down")
                     .font(.system(size: 8, weight: .bold))
             }
             if !trailing { Spacer(minLength: 0) }
         }
-        .frame(width: width)
-        .foregroundStyle(state.sortKey == key ? Color.primary : Color.secondary)
+        .frame(width: width, alignment: trailing ? .trailing : .leading)
+        .foregroundStyle(state.sortField == field ? Color.primary : Color.secondary)
         .contentShape(Rectangle())
-        .onTapGesture { state.toggleSort(key) }
+        .onTapGesture { state.toggleSort(field) }
     }
 }
+
+struct ColumnHeaders: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Spacer().frame(width: 33)     // icon gutter
+            HeaderCell(field: .name, width: state.nameWidth, trailing: false)
+            ResizeHandle(width: state.nameWidth, minWidth: 120,
+                         onChange: { state.nameWidth = $0 },
+                         onEnd: { state.commitWidths() })
+            ForEach(state.columns, id: \.self) { column in
+                HeaderCell(field: .column(column), width: state.width(column), trailing: column.trailing)
+                ResizeHandle(width: state.width(column), minWidth: column.minWidth,
+                             onChange: { state.setWidth(column, $0) },
+                             onEnd: { state.commitWidths() })
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 5)
+        .background(Color.secondary.opacity(0.06))
+        .contextMenu { ColumnMenu() }     // right-click the header to choose columns
+    }
+}
+
+// MARK: - Rows
 
 struct RenameField: View {
     @EnvironmentObject var state: AppState
@@ -600,28 +785,32 @@ struct ListRow: View {
     private var isSelected: Bool { state.selected.contains(entry.url) }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(nsImage: FS.icon(entry.url)).resizable().frame(width: 17, height: 17)
+        HStack(spacing: 0) {
+            Image(nsImage: FS.icon(entry.url))
+                .resizable().frame(width: 17, height: 17)
+                .padding(.leading, 8).padding(.trailing, 8)
 
-            if state.renaming == entry.url {
-                RenameField()
-            } else {
-                Text(entry.name).lineLimit(1).font(.system(size: 12.5))
+            Group {
+                if state.renaming == entry.url {
+                    RenameField()
+                } else {
+                    Text(entry.name).lineLimit(1).font(.system(size: 12.5))
+                        .frame(width: state.nameWidth, alignment: .leading)
+                }
             }
+            .frame(width: state.nameWidth, alignment: .leading)
 
-            Spacer(minLength: 8)
+            Spacer().frame(width: 7)
 
-            Text(entry.isFolder ? "--" : ByteCountFormatter.string(fromByteCount: entry.size, countStyle: .file))
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-                .frame(width: 76, alignment: .trailing)
-            Text(entry.kind).lineLimit(1)
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-                .frame(width: 130, alignment: .leading)
-            Text(entry.modified.formatted(date: .abbreviated, time: .shortened))
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-                .frame(width: 145, alignment: .trailing)
+            ForEach(state.columns, id: \.self) { column in
+                Text(entry.text(for: column)).lineLimit(1)
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .frame(width: state.width(column), alignment: column.trailing ? .trailing : .leading)
+                Spacer().frame(width: 7)
+            }
+            Spacer(minLength: 0)
         }
-        .padding(.vertical, 3).padding(.horizontal, 8)
+        .padding(.vertical, 3)
         .background(
             RoundedRectangle(cornerRadius: 5)
                 .fill(isSelected ? Color.accentColor.opacity(0.22) : Color.clear)
@@ -631,7 +820,7 @@ struct ListRow: View {
         .onTapGesture { toggleSelect() }
         .contextMenu { EntryMenu(entry: entry) }
         .listRowSeparator(.hidden)
-        .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
+        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
     }
 
     private func toggleSelect() {
@@ -642,8 +831,6 @@ struct ListRow: View {
         }
     }
 }
-
-// MARK: - Icon view
 
 struct IconCell: View {
     let entry: Entry
@@ -657,8 +844,7 @@ struct IconCell: View {
             if state.renaming == entry.url {
                 RenameField().frame(width: 96)
             } else {
-                Text(entry.name)
-                    .font(.system(size: 11)).multilineTextAlignment(.center)
+                Text(entry.name).font(.system(size: 11)).multilineTextAlignment(.center)
                     .lineLimit(2).frame(width: 96)
             }
         }
@@ -680,6 +866,40 @@ struct IconCell: View {
     }
 }
 
+// MARK: - Shared row context menu
+
+struct EntryMenu: View {
+    let entry: Entry
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        Button("Open") { state.open(entry) }
+        if entry.isFolder { Button("Open in New Tab") { state.openInNewTab(entry.url) } }
+
+        let apps = state.applications(for: entry.url)
+        if !apps.isEmpty {
+            Menu("Open With") {          // the system's own association list
+                ForEach(apps, id: \.self) { app in
+                    Button(FS.displayName(app)) { state.open(entry.url, with: app) }
+                }
+            }
+        }
+        Divider()
+        Button("Quick Look") { state.selected = [entry.url]; state.quickLook() }
+        Button("Get Info") { state.infoTarget = entry }
+        Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([entry.url]) }
+        if entry.isFolder { Button("Open in Terminal") { state.openTerminal(at: entry.url) } }
+        Divider()
+        ShareLink(item: entry.url) { Text("Share") }
+        Button("Rename") { state.selected = [entry.url]; state.beginRename() }
+        Divider()
+        Button("Copy Path") { state.copyToPasteboard(entry.url.path) }
+        Button("Copy Name") { state.copyToPasteboard(entry.name) }
+        Divider()
+        Button("Move to Trash") { state.selected = [entry.url]; state.moveToTrash() }
+    }
+}
+
 // MARK: - Main window
 
 struct ContentView: View {
@@ -696,10 +916,16 @@ struct ContentView: View {
                 Sidebar().frame(minWidth: 190, idealWidth: 250, maxWidth: 420)
                 VStack(spacing: 0) {
                     if state.viewMode == .list {
-                        columnHeaders
-                        Divider()
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            VStack(spacing: 0) {
+                                ColumnHeaders()
+                                Divider()
+                                listBody
+                            }
+                        }
+                    } else {
+                        iconBody
                     }
-                    content
                     Divider()
                     statusBar
                 }
@@ -710,7 +936,7 @@ struct ContentView: View {
         .onAppear { state.start() }
         .quickLookPreview($state.previewURL)          // the system preview panel
         .sheet(item: $state.infoTarget) { InfoSheet(entry: $0) }
-        .alert("TreeFiles", isPresented: Binding(
+        .alert("Arbor", isPresented: Binding(
             get: { state.errorText != nil },
             set: { if !$0 { state.errorText = nil } }
         )) {
@@ -775,14 +1001,18 @@ struct ContentView: View {
                 }
 
             Picker("", selection: Binding(
-                get: { state.viewMode },
-                set: { state.setViewMode($0) }
+                get: { state.viewMode }, set: { state.setViewMode($0) }
             )) {
-                ForEach(ViewMode.allCases, id: \.self) { mode in
-                    Image(systemName: mode.symbol).tag(mode)
-                }
+                ForEach(ViewMode.allCases, id: \.self) { Image(systemName: $0.symbol).tag($0) }
             }
             .pickerStyle(.segmented).frame(width: 76).labelsHidden()
+
+            Menu {
+                ColumnMenu()
+            } label: {
+                Image(systemName: "slider.horizontal.3")
+            }
+            .menuStyle(.borderlessButton).frame(width: 30).help("Choose columns")
 
             HStack(spacing: 4) {
                 Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(.secondary)
@@ -799,34 +1029,24 @@ struct ContentView: View {
         .padding(.horizontal, 10).padding(.vertical, 7)
     }
 
-    private var columnHeaders: some View {
-        HStack(spacing: 8) {
-            Spacer().frame(width: 17)
-            ColumnHeader(key: .name, width: nil, trailing: false)
-            ColumnHeader(key: .size, width: 76, trailing: true)
-            ColumnHeader(key: .kind, width: 130, trailing: false)
-            ColumnHeader(key: .modified, width: 145, trailing: true)
-        }
-        .padding(.horizontal, 16).padding(.vertical, 5)
-        .background(Color.secondary.opacity(0.06))
-    }
-
     @ViewBuilder
-    private var content: some View {
+    private var listBody: some View {
         if state.rows.isEmpty {
-            VStack {
-                Spacer()
-                Text(state.filter.isEmpty ? "This folder is empty" : "No items match \"\(state.filter)\"")
-                    .foregroundStyle(.secondary).font(.system(size: 13))
-                Spacer()
-            }
-            .frame(maxWidth: .infinity)
-        } else if state.viewMode == .list {
+            emptyState
+        } else {
             List {
                 ForEach(state.rows) { ListRow(entry: $0) }
             }
             .listStyle(.plain)
             .environment(\.defaultMinListRowHeight, 24)
+            .frame(minHeight: 200)
+        }
+    }
+
+    @ViewBuilder
+    private var iconBody: some View {
+        if state.rows.isEmpty {
+            emptyState
         } else {
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 112), spacing: 8)], spacing: 8) {
@@ -835,6 +1055,16 @@ struct ContentView: View {
                 .padding(12)
             }
         }
+    }
+
+    private var emptyState: some View {
+        VStack {
+            Spacer()
+            Text(state.filter.isEmpty ? "This folder is empty" : "No items match \"\(state.filter)\"")
+                .foregroundStyle(.secondary).font(.system(size: 13))
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, minHeight: 220)
     }
 
     private var statusBar: some View {
@@ -881,9 +1111,10 @@ struct InfoSheet: View {
                 row("Size", entry.isFolder ? "--"
                     : ByteCountFormatter.string(fromByteCount: entry.size, countStyle: .file))
                 row("Modified", entry.modified.formatted(date: .long, time: .standard))
-                if let created = try? entry.url.resourceValues(forKeys: [.creationDateKey]).creationDate {
-                    row("Created", created.formatted(date: .long, time: .standard))
+                if entry.created != .distantPast {
+                    row("Created", entry.created.formatted(date: .long, time: .standard))
                 }
+                if !entry.ext.isEmpty { row("Extension", entry.ext) }
             }
             HStack {
                 Button("Copy Path") {
@@ -965,9 +1196,13 @@ struct AppCommands: Commands {
                 ForEach(ViewMode.allCases, id: \.self) { Text($0.label).tag($0) }
             }
             Divider()
-            ForEach(Array(SortKey.allCases.enumerated()), id: \.element) { index, key in
-                Button("Sort by \(key.label)") { state.toggleSort(key) }
-                    .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+            Menu("Columns") { ColumnMenu().environmentObject(state) }
+            Divider()
+            Button("Sort by Name") { state.toggleSort(.name) }
+                .keyboardShortcut("1", modifiers: .command)
+            ForEach(Array(state.columns.enumerated()), id: \.element) { index, column in
+                Button("Sort by \(column.label)") { state.toggleSort(.column(column)) }
+                    .keyboardShortcut(KeyEquivalent(Character("\(min(index + 2, 9))")), modifiers: .command)
             }
             Divider()
             Toggle("Show Hidden Files", isOn: Binding(
@@ -979,11 +1214,11 @@ struct AppCommands: Commands {
 }
 
 @main
-struct TreeFilesApp: App {
+struct ArborApp: App {
     @StateObject private var state = AppState()
 
     var body: some Scene {
-        WindowGroup("TreeFiles") {
+        WindowGroup("Arbor") {
             ContentView().environmentObject(state)
         }
         .commands { AppCommands(state: state) }
