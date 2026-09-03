@@ -151,13 +151,24 @@ final class FileNode: ObservableObject, Identifiable, Hashable {
         populate()
     }
 
-    /// Expand down to a path so navigating on the right reveals the folder on the left.
-    func reveal(_ target: URL) {
+    /// True when `target` is this node or lives underneath it.
+    func contains(_ target: URL) -> Bool {
         let base = url.path == "/" ? "/" : url.path + "/"
-        guard target.path == url.path || target.path.hasPrefix(base) else { return }
+        return target.path == url.path || target.path.hasPrefix(base)
+    }
+
+    /// Expand down to a path, returning the node that was reached so the caller
+    /// can highlight exactly one row.
+    @discardableResult
+    func reveal(_ target: URL) -> FileNode? {
+        guard contains(target) else { return nil }
+        if target.path == url.path { return self }
         if !loaded { load() }
-        if target.path != url.path { isExpanded = true }
-        for child in children { child.reveal(target) }
+        isExpanded = true
+        for child in children {
+            if let hit = child.reveal(target) { return hit }
+        }
+        return nil          // inside this node, but not a folder the tree tracks
     }
 
     static func == (a: FileNode, b: FileNode) -> Bool { a === b }
@@ -303,6 +314,10 @@ final class AppState: ObservableObject {
     @Published var columns: [Column] = [.size, .kind, .modified]
     @Published var widths: [Column: CGFloat] = [:]
 
+    /// Exactly one tree row is highlighted, and navigation unfolds only one tree.
+    @Published var activeNode: UUID?
+    private var activeRoot: FileNode?
+
     @Published var addressText = ""
     @Published var focusAddress = false
     @Published var renaming: URL?
@@ -433,12 +448,42 @@ final class AppState: ObservableObject {
         addressText = folder.path
     }
 
-    func go(_ url: URL) {
+    /// `activate` is the tree row the user clicked, when the navigation came from
+    /// the sidebar. Otherwise the best-matching tree is unfolded instead.
+    func go(_ url: URL, activate: FileNode? = nil) {
         guard tabs.indices.contains(activeIndex) else { return }
         tabs[activeIndex].navigate(to: url)
         filter = ""
         refresh()
-        for node in favorites + locations { node.reveal(url) }
+
+        if let activate {
+            activeRoot = root(containing: activate)
+            activeNode = activate.id
+            return
+        }
+
+        // Stay inside the tree already in use if it still covers the target,
+        // so walking up and down does not make the highlight jump sections.
+        let target: FileNode? = {
+            if let current = activeRoot, current.contains(url) { return current }
+            return bestRoot(for: url)
+        }()
+        activeRoot = target
+        activeNode = target?.reveal(url)?.id
+    }
+
+    /// The most specific root containing this path - the deepest prefix match.
+    private func bestRoot(for url: URL) -> FileNode? {
+        (favorites + locations)
+            .filter { $0.contains(url) }
+            .max { $0.url.path.count < $1.url.path.count }
+    }
+
+    private func root(containing node: FileNode) -> FileNode? {
+        func holds(_ n: FileNode) -> Bool {
+            n === node || n.children.contains(where: holds)
+        }
+        return (favorites + locations).first(where: holds)
     }
 
     func back()    { guard tabs.indices.contains(activeIndex) else { return }
@@ -625,7 +670,7 @@ struct TreeRow: View {
     @ObservedObject var node: FileNode
     @EnvironmentObject var state: AppState
 
-    private var isCurrent: Bool { state.folder == node.url }
+    private var isCurrent: Bool { state.activeNode == node.id }
 
     var body: some View {
         DisclosureGroup(isExpanded: $node.isExpanded) {
@@ -643,7 +688,7 @@ struct TreeRow: View {
             )
             .foregroundStyle(isCurrent ? Color.accentColor : Color.primary)
             .contentShape(Rectangle())
-            .onTapGesture { state.go(node.url) }
+            .onTapGesture { state.go(node.url, activate: node) }
             .contextMenu {
                 Button("Open in New Tab") { state.openInNewTab(node.url) }
                 Button("Show in Finder") {
