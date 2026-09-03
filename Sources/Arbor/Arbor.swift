@@ -31,7 +31,25 @@ enum FS {
         return v?.localizedName ?? url.lastPathComponent
     }
 
-    static func icon(_ url: URL) -> NSImage { NSWorkspace.shared.icon(forFile: url.path) }
+    /// NSWorkspace.icon is a Launch Services lookup. It was being called from
+    /// every row body on every render, so a single re-render cost dozens of
+    /// them. Bounded cache, since icons for a given path do not change often.
+    private static let iconCache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 2000
+        return c
+    }()
+
+    static func icon(_ url: URL) -> NSImage {
+        let key = url.path as NSString
+        if let hit = iconCache.object(forKey: key) { return hit }
+        let image = NSWorkspace.shared.icon(forFile: url.path)
+        image.size = NSSize(width: 32, height: 32)
+        iconCache.setObject(image, forKey: key)
+        return image
+    }
+
+    static func flushIconCache() { iconCache.removeAllObjects() }
 
     /// "rwxr-xr-x" from a POSIX mode.
     static func permissionString(_ mode: Int) -> String {
@@ -84,6 +102,37 @@ enum Column: String, CaseIterable, Codable {
 
     /// Owner and permissions need a stat() per file, so they are only read when shown.
     var needsPOSIX: Bool { self == .owner || self == .permissions }
+}
+
+/// Column widths live apart from AppState on purpose. Publishing them there
+/// re-rendered the whole window - sidebar, tabs and toolbar - on every frame of
+/// a resize drag. Only the header and the list rows observe this.
+final class ColumnLayout: ObservableObject {
+    @Published private var widths: [Column: CGFloat] = [:]
+    private let defaults = UserDefaults.standard
+
+    init() {
+        if let data = defaults.data(forKey: "widths"),
+           let saved = try? JSONDecoder().decode([String: CGFloat].self, from: data) {
+            for (k, v) in saved { if let c = Column(rawValue: k) { widths[c] = v } }
+        }
+    }
+
+    func width(_ column: Column) -> CGFloat { widths[column] ?? column.defaultWidth }
+
+    func setWidth(_ column: Column, _ value: CGFloat) {
+        let clamped = max(column.minWidth, value).rounded()
+        guard widths[column] != clamped else { return }
+        widths[column] = clamped
+    }
+
+    func commit() {
+        var raw: [String: CGFloat] = [:]
+        for (k, v) in widths { raw[k.rawValue] = v }
+        if let data = try? JSONEncoder().encode(raw) { defaults.set(data, forKey: "widths") }
+    }
+
+    func reset() { widths = [:]; commit() }
 }
 
 /// Name is always present and always first, so it is not part of `Column`.
@@ -326,7 +375,6 @@ final class AppState: ObservableObject {
 
     /// Visible columns, in display order. Name is implicit and always first.
     @Published var columns: [Column] = [.size, .kind, .modified]
-    @Published var widths: [Column: CGFloat] = [:]
 
     /// Cut/copy staging. Also mirrored onto NSPasteboard so Finder can paste it.
     @Published var clipboard = Clipboard()
@@ -365,10 +413,6 @@ final class AppState: ObservableObject {
            let saved = try? JSONDecoder().decode([Column].self, from: data) {
             columns = saved
         }
-        if let data = defaults.data(forKey: "widths"),
-           let saved = try? JSONDecoder().decode([String: CGFloat].self, from: data) {
-            for (k, v) in saved { if let c = Column(rawValue: k) { widths[c] = v } }
-        }
     }
 
     private func persist() {
@@ -380,22 +424,9 @@ final class AppState: ObservableObject {
         defaults.set(viewMode.rawValue, forKey: "viewMode")
         defaults.set(showHidden, forKey: "showHidden")
         if let data = try? JSONEncoder().encode(columns) { defaults.set(data, forKey: "columns") }
-        var w: [String: CGFloat] = [:]
-        for (k, v) in widths { w[k.rawValue] = v }
-        if let data = try? JSONEncoder().encode(w) { defaults.set(data, forKey: "widths") }
     }
 
     // MARK: columns
-
-    func width(_ column: Column) -> CGFloat { widths[column] ?? column.defaultWidth }
-
-    func setWidth(_ column: Column, _ value: CGFloat) {
-        let clamped = max(column.minWidth, value).rounded()
-        guard widths[column] != clamped else { return }
-        widths[column] = clamped
-    }
-
-    func commitWidths() { persist() }
 
     func isVisible(_ column: Column) -> Bool { columns.contains(column) }
 
@@ -414,7 +445,6 @@ final class AppState: ObservableObject {
 
     func resetColumns() {
         columns = [.size, .kind, .modified]
-        widths = [:]
         persist()
         refresh()
     }
@@ -889,6 +919,7 @@ struct Sidebar: View {
 
 struct ColumnMenu: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var layout: ColumnLayout
 
     var body: some View {
         ForEach(Column.allCases, id: \.self) { column in
@@ -900,7 +931,7 @@ struct ColumnMenu: View {
             }
         }
         Divider()
-        Button("Reset Columns") { state.resetColumns() }
+        Button("Reset Columns") { state.resetColumns(); layout.reset() }
     }
 }
 
@@ -983,16 +1014,17 @@ struct HeaderCell: View {
 
 struct ColumnHeaders: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var layout: ColumnLayout
 
     var body: some View {
         HStack(spacing: 0) {
             Spacer().frame(width: 33)     // icon gutter
             HeaderCell(field: .name, width: nil, trailing: false)
             ForEach(state.columns, id: \.self) { column in
-                ResizeHandle(width: state.width(column), minWidth: column.minWidth,
-                             onChange: { state.setWidth(column, $0) },
-                             onEnd: { state.commitWidths() })
-                HeaderCell(field: .column(column), width: state.width(column), trailing: column.trailing)
+                ResizeHandle(width: layout.width(column), minWidth: column.minWidth,
+                             onChange: { layout.setWidth(column, $0) },
+                             onEnd: { layout.commit() })
+                HeaderCell(field: .column(column), width: layout.width(column), trailing: column.trailing)
             }
             Spacer().frame(width: 12)
         }
@@ -1022,6 +1054,7 @@ struct RenameField: View {
 struct ListRow: View {
     let entry: Entry
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var layout: ColumnLayout
 
     private var isSelected: Bool { state.selected.contains(entry.url) }
 
@@ -1044,7 +1077,7 @@ struct ListRow: View {
                 Spacer().frame(width: 9)      // matches the header's resize handle
                 Text(entry.text(for: column)).lineLimit(1)
                     .font(.system(size: 11)).foregroundStyle(.secondary)
-                    .frame(width: state.width(column), alignment: column.trailing ? .trailing : .leading)
+                    .frame(width: layout.width(column), alignment: column.trailing ? .trailing : .leading)
             }
             Spacer().frame(width: 12)
         }
@@ -1416,6 +1449,7 @@ struct InfoSheet: View {
 
 struct AppCommands: Commands {
     @ObservedObject var state: AppState
+    @ObservedObject var layout: ColumnLayout
 
     var body: some Commands {
         CommandGroup(after: .newItem) {
@@ -1483,7 +1517,7 @@ struct AppCommands: Commands {
                 ForEach(ViewMode.allCases, id: \.self) { Text($0.label).tag($0) }
             }
             Divider()
-            Menu("Columns") { ColumnMenu().environmentObject(state) }
+            Menu("Columns") { ColumnMenu().environmentObject(state).environmentObject(layout) }
             Divider()
             Button("Sort by Name") { state.toggleSort(.name) }
                 .keyboardShortcut("1", modifiers: .command)
@@ -1503,11 +1537,14 @@ struct AppCommands: Commands {
 @main
 struct ArborApp: App {
     @StateObject private var state = AppState()
+    @StateObject private var layout = ColumnLayout()
 
     var body: some Scene {
         WindowGroup("Arbor") {
-            ContentView().environmentObject(state)
+            ContentView()
+                .environmentObject(state)
+                .environmentObject(layout)
         }
-        .commands { AppCommands(state: state) }
+        .commands { AppCommands(state: state, layout: layout) }
     }
 }
