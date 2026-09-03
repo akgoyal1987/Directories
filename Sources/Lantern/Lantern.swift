@@ -15,6 +15,7 @@
 import SwiftUI
 import AppKit
 import QuickLook
+import UniformTypeIdentifiers
 
 // MARK: - Filesystem helpers
 
@@ -675,7 +676,7 @@ final class AppState: ObservableObject {
         return candidate
     }
 
-    private func transfer(_ urls: [URL], into dest: URL, mode: ClipboardMode) {
+    func transfer(_ urls: [URL], into dest: URL, mode: ClipboardMode) {
         // A folder cannot be moved inside itself, and the check must happen
         // before anything is touched.
         for url in urls where mode == .move {
@@ -747,6 +748,73 @@ final class AppState: ObservableObject {
         refresh()
         if let folder { reloadTreeNode(for: folder) }
         if !failures.isEmpty { errorText = "Could not undo: \(failures.joined(separator: ", "))" }
+    }
+
+    // MARK: drag and drop
+
+    /// The payload of an in-app drag. Held here rather than in the item
+    /// provider because SwiftUI gives one provider per view, and dragging a row
+    /// inside a multi-selection has to carry the whole selection.
+    @Published var dragging: [URL] = []
+
+    func beginDrag(_ url: URL) -> [URL] {
+        let payload = selected.contains(url) ? selectedEntries.map(\.url) : [url]
+        dragging = payload
+        return payload
+    }
+
+    private func sameVolume(_ a: URL, _ b: URL) -> Bool {
+        let key: URLResourceKey = .volumeIdentifierKey
+        guard let va = try? a.resourceValues(forKeys: [key]).volumeIdentifier,
+              let vb = try? b.resourceValues(forKeys: [key]).volumeIdentifier
+        else { return true }        // unknown: assume same, so the default is a move
+        return (va as? NSObject)?.isEqual(vb as? NSObject) ?? true
+    }
+
+    /// Explorer rules: within a volume a drag moves, across volumes it copies.
+    /// Both platforms' override keys are honoured, since neither conflicts.
+    func dropMode(source: URL, destination: URL) -> ClipboardMode {
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.option) || flags.contains(.control) { return .copy }
+        if flags.contains(.command) || flags.contains(.shift) { return .move }
+        return sameVolume(source, destination) ? .move : .copy
+    }
+
+    func performDrop(_ urls: [URL], into destination: URL) {
+        dragging = []
+        let files = urls.filter(\.isFileURL)
+        guard let first = files.first else { return }
+        let mode = dropMode(source: first, destination: destination)
+        // Dropping something into the folder it already lives in is a no-op for
+        // a move, and a deliberate duplicate for a copy.
+        let payload = mode == .copy
+            ? files
+            : files.filter { $0.deletingLastPathComponent().path != destination.path }
+        guard !payload.isEmpty else { return }
+        transfer(payload, into: destination, mode: mode)
+    }
+
+    /// Returns true when the drop is accepted. An in-app drag uses the payload
+    /// recorded at drag start; anything else is read out of the item providers.
+    func handleDrop(_ providers: [NSItemProvider], into destination: URL) -> Bool {
+        if !dragging.isEmpty {
+            let payload = dragging
+            DispatchQueue.main.async { self.performDrop(payload, into: destination) }
+            return true
+        }
+        guard !providers.isEmpty else { return false }
+        let lock = NSLock()
+        var collected: [URL] = []
+        let group = DispatchGroup()
+        for provider in providers {
+            group.enter()
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                if let url, url.isFileURL { lock.lock(); collected.append(url); lock.unlock() }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { self.performDrop(collected, into: destination) }
+        return true
     }
 
     // MARK: recoverable file operations
@@ -862,6 +930,7 @@ final class AppState: ObservableObject {
 struct TreeRow: View {
     @ObservedObject var node: FileNode
     @EnvironmentObject var state: AppState
+    @State private var isDropTarget = false
 
     private var isCurrent: Bool { state.activeNode == node.id }
 
@@ -899,6 +968,19 @@ struct TreeRow: View {
         }
         .listRowSeparator(.hidden)     // no rules between tree rows
         .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+        .onDrag {
+            _ = state.beginDrag(node.url)
+            return NSItemProvider(object: node.url as NSURL)
+        }
+        .onDrop(of: [.fileURL], isTargeted: $isDropTarget) { providers in
+            state.handleDrop(providers, into: node.url)
+        }
+        .overlay {
+            if isDropTarget {
+                RoundedRectangle(cornerRadius: 5)
+                    .strokeBorder(Color.accentColor, lineWidth: 2)
+            }
+        }
     }
 }
 
@@ -1055,10 +1137,30 @@ struct ListRow: View {
     let entry: Entry
     @EnvironmentObject var state: AppState
     @EnvironmentObject var layout: ColumnLayout
+    @State private var isDropTarget = false
 
     private var isSelected: Bool { state.selected.contains(entry.url) }
 
     var body: some View {
+        // Only folders accept a drop; a file row must stay inert so the drop
+        // falls through to the folder being browsed.
+        if entry.isFolder {
+            row
+                .onDrop(of: [.fileURL], isTargeted: $isDropTarget) { providers in
+                    state.handleDrop(providers, into: entry.url)
+                }
+                .overlay {
+                    if isDropTarget {
+                        RoundedRectangle(cornerRadius: 5)
+                            .strokeBorder(Color.accentColor, lineWidth: 2)
+                    }
+                }
+        } else {
+            row
+        }
+    }
+
+    private var row: some View {
         HStack(spacing: 0) {
             Image(nsImage: FS.icon(entry.url))
                 .resizable().frame(width: 17, height: 17)
@@ -1093,6 +1195,10 @@ struct ListRow: View {
         .contextMenu { EntryMenu(entry: entry) }
         .listRowSeparator(.hidden)
         .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+        .onDrag {
+            _ = state.beginDrag(entry.url)
+            return NSItemProvider(object: entry.url as NSURL)
+        }
     }
 
     private func toggleSelect() {
@@ -1107,10 +1213,28 @@ struct ListRow: View {
 struct IconCell: View {
     let entry: Entry
     @EnvironmentObject var state: AppState
+    @State private var isDropTarget = false
 
     private var isSelected: Bool { state.selected.contains(entry.url) }
 
     var body: some View {
+        if entry.isFolder {
+            cell
+                .onDrop(of: [.fileURL], isTargeted: $isDropTarget) { providers in
+                    state.handleDrop(providers, into: entry.url)
+                }
+                .overlay {
+                    if isDropTarget {
+                        RoundedRectangle(cornerRadius: 7)
+                            .strokeBorder(Color.accentColor, lineWidth: 2)
+                    }
+                }
+        } else {
+            cell
+        }
+    }
+
+    private var cell: some View {
         VStack(spacing: 5) {
             Image(nsImage: FS.icon(entry.url)).resizable().frame(width: 46, height: 46)
             if state.renaming == entry.url {
@@ -1135,6 +1259,10 @@ struct IconCell: View {
             }
         }
         .contextMenu { EntryMenu(entry: entry) }
+        .onDrag {
+            _ = state.beginDrag(entry.url)
+            return NSItemProvider(object: entry.url as NSURL)
+        }
     }
 }
 
@@ -1191,6 +1319,7 @@ struct EntryMenu: View {
 struct ContentView: View {
     @EnvironmentObject var state: AppState
     @FocusState private var addressFocused: Bool
+    @State private var panelDropTarget = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1212,6 +1341,19 @@ struct ContentView: View {
                     statusBar
                 }
                 .frame(minWidth: 440)
+                // Empty space in the panel targets the folder being browsed, so
+                // a drag from the tree can land without aiming at a row.
+                .onDrop(of: [.fileURL], isTargeted: $panelDropTarget) { providers in
+                    guard let folder = state.folder else { return false }
+                    return state.handleDrop(providers, into: folder)
+                }
+                .overlay {
+                    if panelDropTarget {
+                        Rectangle()
+                            .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 2)
+                            .allowsHitTesting(false)
+                    }
+                }
             }
         }
         .frame(minWidth: 940, minHeight: 540)
