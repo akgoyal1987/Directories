@@ -290,7 +290,6 @@ final class AppState: ObservableObject {
     /// Visible columns, in display order. Name is implicit and always first.
     @Published var columns: [Column] = [.size, .kind, .modified]
     @Published var widths: [Column: CGFloat] = [:]
-    @Published var nameWidth: CGFloat = 300
 
     @Published var addressText = ""
     @Published var focusAddress = false
@@ -318,7 +317,6 @@ final class AppState: ObservableObject {
            let saved = try? JSONDecoder().decode([String: CGFloat].self, from: data) {
             for (k, v) in saved { if let c = Column(rawValue: k) { widths[c] = v } }
         }
-        nameWidth = defaults.object(forKey: "nameWidth") as? CGFloat ?? 300
     }
 
     private func persist() {
@@ -333,7 +331,6 @@ final class AppState: ObservableObject {
         var w: [String: CGFloat] = [:]
         for (k, v) in widths { w[k.rawValue] = v }
         if let data = try? JSONEncoder().encode(w) { defaults.set(data, forKey: "widths") }
-        defaults.set(nameWidth, forKey: "nameWidth")
     }
 
     // MARK: columns
@@ -364,7 +361,6 @@ final class AppState: ObservableObject {
     func resetColumns() {
         columns = [.size, .kind, .modified]
         widths = [:]
-        nameWidth = 300
         persist()
         refresh()
     }
@@ -695,22 +691,22 @@ struct ResizeHandle: View {
     @State private var startWidth: CGFloat?
 
     var body: some View {
-        Rectangle()
-            .fill(Color.secondary.opacity(0.22))
-            .frame(width: 1)
-            .padding(.horizontal, 3)
-            .contentShape(Rectangle())
-            .onHover { inside in
-                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 1)
-                    .onChanged { g in
-                        if startWidth == nil { startWidth = width }
-                        onChange(max(minWidth, (startWidth ?? width) + g.translation.width))
-                    }
-                    .onEnded { _ in startWidth = nil; onEnd() }
-            )
+        ZStack {
+            Color.clear.frame(width: 9, height: 18)
+            Rectangle().fill(Color.secondary.opacity(0.30)).frame(width: 1, height: 12)
+        }
+        .contentShape(Rectangle())
+        .onHover { inside in
+            if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 1)
+                .onChanged { g in
+                    if startWidth == nil { startWidth = width }
+                    onChange(max(minWidth, (startWidth ?? width) + g.translation.width))
+                }
+                .onEnded { _ in startWidth = nil; onEnd() }
+        )
     }
 }
 
@@ -730,6 +726,7 @@ struct HeaderCell: View {
             }
             if !trailing { Spacer(minLength: 0) }
         }
+        .frame(maxWidth: width == nil ? .infinity : nil, alignment: trailing ? .trailing : .leading)
         .frame(width: width, alignment: trailing ? .trailing : .leading)
         .foregroundStyle(state.sortField == field ? Color.primary : Color.secondary)
         .contentShape(Rectangle())
@@ -743,19 +740,16 @@ struct ColumnHeaders: View {
     var body: some View {
         HStack(spacing: 0) {
             Spacer().frame(width: 33)     // icon gutter
-            HeaderCell(field: .name, width: state.nameWidth, trailing: false)
-            ResizeHandle(width: state.nameWidth, minWidth: 120,
-                         onChange: { state.nameWidth = $0 },
-                         onEnd: { state.commitWidths() })
+            HeaderCell(field: .name, width: nil, trailing: false)
             ForEach(state.columns, id: \.self) { column in
-                HeaderCell(field: .column(column), width: state.width(column), trailing: column.trailing)
                 ResizeHandle(width: state.width(column), minWidth: column.minWidth,
                              onChange: { state.setWidth(column, $0) },
                              onEnd: { state.commitWidths() })
+                HeaderCell(field: .column(column), width: state.width(column), trailing: column.trailing)
             }
-            Spacer(minLength: 0)
+            Spacer().frame(width: 12)
         }
-        .padding(.vertical, 5)
+        .frame(height: 22)
         .background(Color.secondary.opacity(0.06))
         .contextMenu { ColumnMenu() }     // right-click the header to choose columns
     }
@@ -795,20 +789,17 @@ struct ListRow: View {
                     RenameField()
                 } else {
                     Text(entry.name).lineLimit(1).font(.system(size: 12.5))
-                        .frame(width: state.nameWidth, alignment: .leading)
                 }
             }
-            .frame(width: state.nameWidth, alignment: .leading)
-
-            Spacer().frame(width: 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             ForEach(state.columns, id: \.self) { column in
+                Spacer().frame(width: 9)      // matches the header's resize handle
                 Text(entry.text(for: column)).lineLimit(1)
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                     .frame(width: state.width(column), alignment: column.trailing ? .trailing : .leading)
-                Spacer().frame(width: 7)
             }
-            Spacer(minLength: 0)
+            Spacer().frame(width: 12)
         }
         .padding(.vertical, 3)
         .background(
@@ -913,16 +904,12 @@ struct ContentView: View {
             toolbar
             Divider()
             HSplitView {
-                Sidebar().frame(minWidth: 190, idealWidth: 250, maxWidth: 420)
+                Sidebar().frame(minWidth: 150, idealWidth: 195, maxWidth: 340)
                 VStack(spacing: 0) {
                     if state.viewMode == .list {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            VStack(spacing: 0) {
-                                ColumnHeaders()
-                                Divider()
-                                listBody
-                            }
-                        }
+                        ColumnHeaders()
+                        Divider()
+                        listBody
                     } else {
                         iconBody
                     }
@@ -1039,7 +1026,6 @@ struct ContentView: View {
             }
             .listStyle(.plain)
             .environment(\.defaultMinListRowHeight, 24)
-            .frame(minHeight: 200)
         }
     }
 
