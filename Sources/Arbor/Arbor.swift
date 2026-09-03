@@ -270,6 +270,16 @@ func sortEntries(_ list: [Entry], by field: SortField, ascending: Bool) -> [Entr
     return folders + files
 }
 
+// MARK: - Clipboard
+
+enum ClipboardMode { case copy, move }
+
+struct Clipboard {
+    var urls: [URL] = []
+    var mode: ClipboardMode = .copy
+    var isEmpty: Bool { urls.isEmpty }
+}
+
 // MARK: - Tabs
 
 struct Tab: Identifiable {
@@ -313,6 +323,17 @@ final class AppState: ObservableObject {
     /// Visible columns, in display order. Name is implicit and always first.
     @Published var columns: [Column] = [.size, .kind, .modified]
     @Published var widths: [Column: CGFloat] = [:]
+
+    /// Cut/copy staging. Also mirrored onto NSPasteboard so Finder can paste it.
+    @Published var clipboard = Clipboard()
+
+    // A transfer runs off the main thread and reports progress back to a sheet.
+    @Published var opRunning = false
+    @Published var opTotal = 0
+    @Published var opDone = 0
+    @Published var opCurrent = ""
+    private var opCancelled = false
+    private var lastOperation: [(from: URL, to: URL, mode: ClipboardMode)] = []
 
     /// Exactly one tree row is highlighted, and navigation unfolds only one tree.
     @Published var activeNode: UUID?
@@ -561,6 +582,136 @@ final class AppState: ObservableObject {
 
     func copyLocation() { copyToPasteboard(selectedEntries.first?.url.path ?? folder?.path ?? "") }
 
+    // MARK: cut, copy, paste
+
+    func copySelection() { stage(selectedEntries.map(\.url), .copy) }
+    func cutSelection()  { stage(selectedEntries.map(\.url), .move) }
+
+    func stage(_ urls: [URL], _ mode: ClipboardMode) {
+        guard !urls.isEmpty else { return }
+        clipboard = Clipboard(urls: urls, mode: mode)
+        // Mirror onto the system pasteboard so Finder and other apps can paste.
+        // A cut cannot be expressed there, so cross-app it behaves as a copy.
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects(urls as [NSURL])
+    }
+
+    var canPaste: Bool {
+        !clipboard.isEmpty || !(NSPasteboard.general.readObjects(forClasses: [NSURL.self]) ?? []).isEmpty
+    }
+
+    func paste(into destination: URL? = nil) {
+        guard let dest = destination ?? folder else { return }
+        var urls = clipboard.urls
+        var mode = clipboard.mode
+        if urls.isEmpty {
+            // Nothing of ours staged: accept whatever Finder put on the pasteboard.
+            urls = (NSPasteboard.general.readObjects(forClasses: [NSURL.self]) as? [URL] ?? [])
+                .filter(\.isFileURL)
+            mode = .copy
+        }
+        guard !urls.isEmpty else { return }
+        transfer(urls, into: dest, mode: mode)
+    }
+
+    func duplicateSelection() {
+        let urls = selectedEntries.map(\.url)
+        guard !urls.isEmpty, let dest = folder else { return }
+        transfer(urls, into: dest, mode: .copy)
+    }
+
+    /// Never overwrites. A name collision produces "x copy", "x copy 2", ...
+    private static func uniqueDestination(for source: URL, in dir: URL) -> URL {
+        let fm = FileManager.default
+        var candidate = dir.appendingPathComponent(source.lastPathComponent)
+        guard fm.fileExists(atPath: candidate.path) else { return candidate }
+        let base = source.deletingPathExtension().lastPathComponent
+        let ext = source.pathExtension
+        var n = 1
+        repeat {
+            let suffix = n == 1 ? "copy" : "copy \(n)"
+            let name = ext.isEmpty ? "\(base) \(suffix)" : "\(base) \(suffix).\(ext)"
+            candidate = dir.appendingPathComponent(name)
+            n += 1
+        } while fm.fileExists(atPath: candidate.path)
+        return candidate
+    }
+
+    private func transfer(_ urls: [URL], into dest: URL, mode: ClipboardMode) {
+        // A folder cannot be moved inside itself, and the check must happen
+        // before anything is touched.
+        for url in urls where mode == .move {
+            if dest.path == url.path || dest.path.hasPrefix(url.path + "/") {
+                errorText = "Cannot move \"\(url.lastPathComponent)\" into itself."
+                return
+            }
+        }
+
+        opRunning = true
+        opTotal = urls.count
+        opDone = 0
+        opCurrent = ""
+        opCancelled = false
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            var performed: [(from: URL, to: URL, mode: ClipboardMode)] = []
+            var failures: [String] = []
+
+            for url in urls {
+                if self.opCancelled { break }
+                DispatchQueue.main.async { self.opCurrent = url.lastPathComponent }
+                let target = Self.uniqueDestination(for: url, in: dest)
+                do {
+                    if mode == .move { try fm.moveItem(at: url, to: target) }
+                    else            { try fm.copyItem(at: url, to: target) }
+                    performed.append((from: url, to: target, mode: mode))
+                } catch {
+                    failures.append(url.lastPathComponent)
+                }
+                DispatchQueue.main.async { self.opDone += 1 }
+            }
+
+            DispatchQueue.main.async {
+                self.opRunning = false
+                self.lastOperation = performed
+                if mode == .move { self.clipboard = Clipboard() }
+                self.refresh()
+                self.reloadTreeNode(for: dest)
+                if !failures.isEmpty {
+                    self.errorText = "Could not complete for: \(failures.joined(separator: ", "))"
+                }
+            }
+        }
+    }
+
+    func cancelOperation() { opCancelled = true }
+
+    var canUndo: Bool { !lastOperation.isEmpty }
+
+    /// Reverses the last transfer. An undone copy goes to the Trash rather than
+    /// being unlinked, so undo itself is recoverable.
+    func undoLastOperation() {
+        let ops = lastOperation
+        lastOperation = []
+        guard !ops.isEmpty else { return }
+        let fm = FileManager.default
+        var failures: [String] = []
+        for op in ops.reversed() {
+            do {
+                if op.mode == .move { try fm.moveItem(at: op.to, to: op.from) }
+                else                { try fm.trashItem(at: op.to, resultingItemURL: nil) }
+            } catch {
+                failures.append(op.to.lastPathComponent)
+            }
+        }
+        refresh()
+        if let folder { reloadTreeNode(for: folder) }
+        if !failures.isEmpty { errorText = "Could not undo: \(failures.joined(separator: ", "))" }
+    }
+
     // MARK: recoverable file operations
 
     func newFolder() {
@@ -623,7 +774,7 @@ final class AppState: ObservableObject {
         if !failed.isEmpty { errorText = "Could not move to Trash: \(failed.joined(separator: ", "))" }
     }
 
-    private func reloadTreeNode(for url: URL) {
+    func reloadTreeNode(for url: URL) {
         func walk(_ node: FileNode) {
             if node.url == url { node.reload(); return }
             for child in node.children { walk(child) }
@@ -695,6 +846,11 @@ struct TreeRow: View {
                     NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: node.url.path)
                 }
                 Button("Open in Terminal") { state.openTerminal(at: node.url) }
+                Divider()
+                Button("Cut") { state.stage([node.url], .move) }
+                Button("Copy") { state.stage([node.url], .copy) }
+                Button("Paste Into Folder") { state.paste(into: node.url) }
+                    .disabled(!state.canPaste)
                 Divider()
                 Button("Copy Path") { state.copyToPasteboard(node.url.path) }
             }
@@ -863,6 +1019,7 @@ struct ListRow: View {
             RoundedRectangle(cornerRadius: 5)
                 .fill(isSelected ? Color.accentColor.opacity(0.22) : Color.clear)
         )
+        .opacity(state.clipboard.mode == .move && state.clipboard.urls.contains(entry.url) ? 0.45 : 1)
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { state.open(entry) }
         .onTapGesture { toggleSelect() }
@@ -920,6 +1077,11 @@ struct EntryMenu: View {
     let entry: Entry
     @EnvironmentObject var state: AppState
 
+    /// Right-clicking a row outside the current selection acts on that row.
+    private func ensureSelected() {
+        if !state.selected.contains(entry.url) { state.selected = [entry.url] }
+    }
+
     var body: some View {
         Button("Open") { state.open(entry) }
         if entry.isFolder { Button("Open in New Tab") { state.openInNewTab(entry.url) } }
@@ -937,6 +1099,15 @@ struct EntryMenu: View {
         Button("Get Info") { state.infoTarget = entry }
         Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([entry.url]) }
         if entry.isFolder { Button("Open in Terminal") { state.openTerminal(at: entry.url) } }
+        Divider()
+        Button("Cut") { ensureSelected(); state.cutSelection() }
+        Button("Copy") { ensureSelected(); state.copySelection() }
+        if entry.isFolder {
+            Button("Paste Into Folder") { state.paste(into: entry.url) }.disabled(!state.canPaste)
+        } else {
+            Button("Paste") { state.paste() }.disabled(!state.canPaste)
+        }
+        Button("Duplicate") { ensureSelected(); state.duplicateSelection() }
         Divider()
         ShareLink(item: entry.url) { Text("Share") }
         Button("Rename") { state.selected = [entry.url]; state.beginRename() }
@@ -980,6 +1151,9 @@ struct ContentView: View {
         .onAppear { state.start() }
         .quickLookPreview($state.previewURL)          // the system preview panel
         .sheet(item: $state.infoTarget) { InfoSheet(entry: $0) }
+        .sheet(isPresented: Binding(
+            get: { state.opRunning }, set: { if !$0 { state.cancelOperation() } }
+        )) { TransferSheet() }
         .alert("Arbor", isPresented: Binding(
             get: { state.errorText != nil },
             set: { if !$0 { state.errorText = nil } }
@@ -1133,6 +1307,30 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Transfer progress
+
+struct TransferSheet: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Copying items").font(.headline)
+            ProgressView(value: Double(state.opDone), total: Double(max(state.opTotal, 1)))
+            Text(state.opCurrent.isEmpty ? " " : state.opCurrent)
+                .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+            HStack {
+                Text("\(state.opDone) of \(state.opTotal)")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Spacer()
+                // Cancel stops before the next item; it cannot interrupt a file
+                // already being written.
+                Button("Cancel") { state.cancelOperation() }
+            }
+        }
+        .padding(20).frame(width: 360)
+    }
+}
+
 // MARK: - Get Info
 
 struct InfoSheet: View {
@@ -1203,6 +1401,18 @@ struct AppCommands: Commands {
         }
 
         CommandGroup(after: .pasteboard) {
+            Button("Cut") { state.cutSelection() }
+                .keyboardShortcut("x").disabled(state.selected.isEmpty)
+            Button("Copy") { state.copySelection() }
+                .keyboardShortcut("c").disabled(state.selected.isEmpty)
+            Button("Paste") { state.paste() }
+                .keyboardShortcut("v").disabled(!state.canPaste)
+            Button("Duplicate") { state.duplicateSelection() }
+                .keyboardShortcut("d").disabled(state.selected.isEmpty)
+            Divider()
+            Button("Undo Last File Operation") { state.undoLastOperation() }
+                .keyboardShortcut("z").disabled(!state.canUndo)
+            Divider()
             Button("Select All") { state.selectAll() }.keyboardShortcut("a")
             Button("Rename") { state.beginRename() }.disabled(state.selected.count != 1)
             Button("Move to Trash") { state.moveToTrash() }
