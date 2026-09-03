@@ -312,11 +312,15 @@ final class AppState: ObservableObject {
     @Published var favorites: [FileNode] = []
     @Published var locations: [FileNode] = []
 
-    @Published private var allRows: [Entry] = []
+    private var allRows: [Entry] = []
+    /// Filtered and sorted once per change, not once per read. SwiftUI reads
+    /// this many times per render pass, so recomputing here made every drag
+    /// re-sort the whole folder.
+    @Published private(set) var rows: [Entry] = []
     @Published var selected: Set<URL> = []
-    @Published var filter = ""
-    @Published var sortField: SortField = .name
-    @Published var sortAscending = true
+    @Published var filter = "" { didSet { recomputeRows() } }
+    @Published var sortField: SortField = .name { didSet { recomputeRows() } }
+    @Published var sortAscending = true { didSet { recomputeRows() } }
     @Published var viewMode: ViewMode = .list
     @Published var showHidden = false
 
@@ -421,11 +425,11 @@ final class AppState: ObservableObject {
     var active: Tab? { tabs.indices.contains(activeIndex) ? tabs[activeIndex] : nil }
     var folder: URL? { active?.folder }
 
-    var rows: [Entry] {
+    private func recomputeRows() {
         let base = filter.isEmpty
             ? allRows
             : allRows.filter { $0.name.localizedCaseInsensitiveContains(filter) }
-        return sortEntries(base, by: sortField, ascending: sortAscending)
+        rows = sortEntries(base, by: sortField, ascending: sortAscending)
     }
 
     var selectedEntries: [Entry] { rows.filter { selected.contains($0.url) } }
@@ -465,6 +469,7 @@ final class AppState: ObservableObject {
     func refresh() {
         guard let folder else { return }
         allRows = readEntries(folder, showHidden: showHidden, posix: needsPOSIX)
+        recomputeRows()
         selected = []
         addressText = folder.path
     }
@@ -806,7 +811,12 @@ final class AppState: ObservableObject {
     }
 
     func toggleSort(_ field: SortField) {
-        if sortField == field { sortAscending.toggle() } else { sortField = field; sortAscending = true }
+        if sortField == field {
+            sortAscending.toggle()
+        } else {
+            sortField = field
+            if !sortAscending { sortAscending = true }   // avoid a second recompute
+        }
         persist()
     }
 
@@ -894,10 +904,15 @@ struct ColumnMenu: View {
 
 // MARK: - Header
 
-/// A draggable divider that resizes the column to its left.
+/// A draggable divider sitting to the LEFT of the column it controls.
+///
+/// Dragging right must make that column narrower, not wider: the row is a fixed
+/// width, so a wider right-hand column squeezes the flexible Name column and
+/// pulls the divider away from the cursor. The delta is therefore subtracted.
 struct ResizeHandle: View {
     let width: CGFloat
     let minWidth: CGFloat
+    var maxWidth: CGFloat = 420      // stop one column swallowing the whole row
     let onChange: (CGFloat) -> Void
     let onEnd: () -> Void
 
@@ -916,7 +931,8 @@ struct ResizeHandle: View {
             DragGesture(minimumDistance: 1)
                 .onChanged { g in
                     if startWidth == nil { startWidth = width }
-                    onChange(max(minWidth, (startWidth ?? width) + g.translation.width))
+                    let base = startWidth ?? width
+                    onChange(min(maxWidth, max(minWidth, base - g.translation.width)))
                 }
                 .onEnded { _ in startWidth = nil; onEnd() }
         )
