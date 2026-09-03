@@ -390,7 +390,9 @@ final class AppState: ObservableObject {
     func width(_ column: Column) -> CGFloat { widths[column] ?? column.defaultWidth }
 
     func setWidth(_ column: Column, _ value: CGFloat) {
-        widths[column] = max(column.minWidth, value)
+        let clamped = max(column.minWidth, value).rounded()
+        guard widths[column] != clamped else { return }
+        widths[column] = clamped
     }
 
     func commitWidths() { persist() }
@@ -917,6 +919,7 @@ struct ResizeHandle: View {
     let onEnd: () -> Void
 
     @State private var startWidth: CGFloat?
+    @State private var cursorPushed = false
 
     var body: some View {
         ZStack {
@@ -925,16 +928,31 @@ struct ResizeHandle: View {
         }
         .contentShape(Rectangle())
         .onHover { inside in
-            if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            // push/pop must be balanced. Firing push() on every hover callback
+            // corrupts the cursor stack and makes the pointer flicker.
+            if inside, !cursorPushed { NSCursor.resizeLeftRight.push(); cursorPushed = true }
+            if !inside, cursorPushed { NSCursor.pop(); cursorPushed = false }
         }
         .gesture(
             DragGesture(minimumDistance: 1)
                 .onChanged { g in
                     if startWidth == nil { startWidth = width }
                     let base = startWidth ?? width
-                    onChange(min(maxWidth, max(minWidth, base - g.translation.width)))
+                    // Whole points only: subpixel churn republishes state for
+                    // changes too small to see.
+                    let next = min(maxWidth, max(minWidth, base - g.translation.width)).rounded()
+                    guard next != width else { return }
+                    // Without this, SwiftUI interpolates every intermediate
+                    // width and the overlapping animations read as flicker.
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) { onChange(next) }
                 }
-                .onEnded { _ in startWidth = nil; onEnd() }
+                .onEnded { _ in
+                    startWidth = nil
+                    if cursorPushed { NSCursor.pop(); cursorPushed = false }
+                    onEnd()
+                }
         )
     }
 }
