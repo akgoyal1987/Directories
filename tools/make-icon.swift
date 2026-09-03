@@ -6,47 +6,42 @@
 //   swift tools/make-icon.swift <output.iconset directory> [variant]
 //   swift tools/make-icon.swift --preview <out.png>     # all variants side by side
 //
-// The mark is an "L" monogram rather than a pictogram.
+// Every mark has to answer "what does this app do?" before it answers "what is
+// it called", so each one leads with a file or browsing signal and uses the
+// warm light to explain the name.
 
 import AppKit
 
 enum Variant: Int, CaseIterable {
-    case warm = 1      // white L on a warm amber gradient
-    case night = 2     // amber L glowing out of a deep navy ground
-    case outline = 3   // hollow stroked L on amber
-    case graphite = 4  // amber L on graphite, understated
+    case panes = 1       // the app's own layout: sidebar plus a list of rows
+    case magnify = 2     // a folder under a magnifier
+    case stack = 3       // folders receding into depth, the front one lit
+    case lanternLit = 4  // an actual lantern throwing light onto a folder
+    case drawer = 5      // a filing drawer pulled open, light spilling out
+    case openFolder = 6  // an open folder with documents rising from it
 
     var name: String {
         switch self {
-        case .warm: return "warm"
-        case .night: return "night"
-        case .outline: return "outline"
-        case .graphite: return "graphite"
+        case .panes:      return "panes"
+        case .magnify:    return "magnify"
+        case .stack:      return "stack"
+        case .lanternLit: return "lantern-lit"
+        case .drawer:     return "drawer"
+        case .openFolder: return "open-folder"
         }
     }
 }
 
-func rgb(_ r: Int, _ g: Int, _ b: Int) -> NSColor {
-    NSColor(srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1)
+func rgb(_ r: Int, _ g: Int, _ b: Int, _ a: CGFloat = 1) -> NSColor {
+    NSColor(srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: a)
 }
 
-func plateColors(_ v: Variant) -> (NSColor, NSColor) {
-    switch v {
-    case .warm:     return (rgb(255, 196, 107), rgb(217, 119, 6))
-    case .night:    return (rgb(40, 58, 86),    rgb(11, 18, 32))
-    case .outline:  return (rgb(251, 176, 59),  rgb(180, 83, 9))
-    case .graphite: return (rgb(90, 90, 100),   rgb(24, 24, 27))
-    }
-}
-
-func letterColor(_ v: Variant) -> NSColor {
-    switch v {
-    case .warm:     return .white
-    case .night:    return rgb(251, 191, 36)
-    case .outline:  return .white
-    case .graphite: return rgb(252, 211, 77)
-    }
-}
+// The night palette: a deep navy plate with a warm amber light.
+let plateTop = rgb(40, 58, 86)
+let plateBottom = rgb(11, 18, 32)
+let amber = rgb(251, 191, 36)
+let amberBright = rgb(254, 219, 143)
+let amberDim = rgb(180, 130, 40)
 
 func draw(size: CGFloat, variant: Variant) -> NSBitmapImageRep {
     let px = Int(size)
@@ -59,84 +54,136 @@ func draw(size: CGFloat, variant: Variant) -> NSBitmapImageRep {
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
     let ctx = NSGraphicsContext.current!.cgContext
-    let s = size / 100.0                      // one unit of a 100x100 space
+    let s = size / 100.0                       // one unit of a 100x100 space
 
-    // macOS icons leave a margin: the art occupies roughly 80% of the canvas.
+    // Art is authored top-left down; the context origin is bottom-left.
+    func X(_ v: CGFloat) -> CGFloat { v * s }
+    func Y(_ v: CGFloat) -> CGFloat { (100 - v) * s }
+    func P(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: X(x), y: Y(y)) }
+    func R(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) -> CGRect {
+        CGRect(x: X(x), y: Y(y + h), width: w * s, height: h * s)
+    }
+    func rounded(_ r: CGRect, _ radius: CGFloat) -> CGPath {
+        CGPath(roundedRect: r, cornerWidth: radius * s, cornerHeight: radius * s, transform: nil)
+    }
+    func fill(_ r: CGRect, _ radius: CGFloat, _ color: NSColor) {
+        ctx.setFillColor(color.cgColor); ctx.addPath(rounded(r, radius)); ctx.fillPath()
+    }
+
+    // ---- plate ----
     let inset: CGFloat = 10
     let plate = CGRect(x: inset * s, y: inset * s,
                        width: (100 - inset * 2) * s, height: (100 - inset * 2) * s)
-    let corner = plate.width * 0.2237         // the system's squircle proportion
-    let platePath = CGPath(roundedRect: plate, cornerWidth: corner, cornerHeight: corner,
-                           transform: nil)
-
     ctx.saveGState()
-    ctx.addPath(platePath)
+    ctx.addPath(CGPath(roundedRect: plate, cornerWidth: plate.width * 0.2237,
+                       cornerHeight: plate.width * 0.2237, transform: nil))
     ctx.clip()
+    ctx.drawLinearGradient(
+        CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                   colors: [plateTop.cgColor, plateBottom.cgColor] as CFArray,
+                   locations: [0, 1])!,
+        start: CGPoint(x: plate.midX, y: plate.maxY),
+        end: CGPoint(x: plate.midX, y: plate.minY), options: [])
 
-    let (top, bottom) = plateColors(variant)
-    let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                              colors: [top.cgColor, bottom.cgColor] as CFArray,
-                              locations: [0, 1])!
-    ctx.drawLinearGradient(gradient,
-                           start: CGPoint(x: plate.midX, y: plate.maxY),
-                           end: CGPoint(x: plate.midX, y: plate.minY),
-                           options: [])
-
-    // A soft top sheen, faded out so it leaves no seam across the middle.
-    let sheen = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                           colors: [NSColor(white: 1, alpha: 0.16).cgColor,
-                                    NSColor(white: 1, alpha: 0.0).cgColor] as CFArray,
-                           locations: [0, 1])!
-    ctx.drawLinearGradient(sheen,
-                           start: CGPoint(x: plate.midX, y: plate.maxY),
-                           end: CGPoint(x: plate.midX, y: plate.midY),
-                           options: [])
-
-    // The name earns a glow: a warm pool of light behind the letter.
-    if variant == .night {
-        let glow = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                              colors: [NSColor(srgbRed: 1, green: 0.79, blue: 0.30, alpha: 0.40).cgColor,
-                                       NSColor(srgbRed: 1, green: 0.79, blue: 0.30, alpha: 0.0).cgColor] as CFArray,
-                              locations: [0, 1])!
-        ctx.drawRadialGradient(glow,
-                               startCenter: CGPoint(x: plate.midX, y: plate.midY), startRadius: 0,
-                               endCenter: CGPoint(x: plate.midX, y: plate.midY),
-                               endRadius: plate.width * 0.52,
-                               options: [])
+    func glow(_ centre: CGPoint, _ radius: CGFloat, _ strength: CGFloat) {
+        ctx.drawRadialGradient(
+            CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                       colors: [rgb(255, 201, 77, strength).cgColor,
+                                rgb(255, 201, 77, 0).cgColor] as CFArray,
+                       locations: [0, 1])!,
+            startCenter: centre, startRadius: 0,
+            endCenter: centre, endRadius: radius, options: [])
     }
-    ctx.restoreGState()
 
-    // ---- the monogram ----
-    // Centre on the glyph outline, not the text line box: a line box carries
-    // ascender and descender space the "L" does not use, which pushes it high
-    // enough to clip the plate.
-    let uiFont = NSFont.systemFont(ofSize: 100, weight: .black)
-    let ctFont = uiFont as CTFont
-    var chars: [UniChar] = Array("L".utf16)
-    var glyphs = [CGGlyph](repeating: 0, count: chars.count)
-    if CTFontGetGlyphsForCharacters(ctFont, &chars, &glyphs, chars.count),
-       let glyph = CTFontCreatePathForGlyph(ctFont, glyphs[0], nil) {
-        let box = glyph.boundingBox
-        let targetHeight = 44 * s
-        let scale = targetHeight / box.height
-        var transform = CGAffineTransform.identity
-            .translatedBy(x: plate.midX - box.midX * scale,
-                          y: plate.midY - box.midY * scale)
-            .scaledBy(x: scale, y: scale)
-        if let placed = glyph.copy(using: &transform) {
-            ctx.addPath(placed)
-            if variant == .outline {
-                ctx.setStrokeColor(letterColor(variant).cgColor)
-                ctx.setLineWidth(4.5 * s)
-                ctx.setLineJoin(.round)
-                ctx.strokePath()
-            } else {
-                ctx.setFillColor(letterColor(variant).cgColor)
-                ctx.fillPath()
-            }
+    // A folder: body plus a tab on its top left.
+    func folder(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat,
+                _ radius: CGFloat, _ color: NSColor) {
+        let tabH = h * 0.22
+        fill(R(x, y, w * 0.44, tabH * 2), radius * 0.7, color)
+        fill(R(x, y + tabH, w, h - tabH), radius, color)
+    }
+
+    switch variant {
+
+    case .panes:
+        // A miniature of the app itself: sidebar on the left, rows on the right.
+        glow(P(50, 50), plate.width * 0.50, 0.30)
+        fill(R(22, 28, 56, 44), 5, rgb(255, 255, 255, 0.14))
+        fill(R(22, 28, 17, 44), 5, amber)
+        for y in [stride(from: CGFloat(36), to: 66, by: 10)].flatMap({ Array($0) }) {
+            fill(R(44, y, 28, 5), 2.5, amberBright)
         }
+
+    case .magnify:
+        glow(P(44, 44), plate.width * 0.46, 0.40)
+        folder(24, 28, 42, 32, 4, amber)
+        // Ring drawn twice: a dark pass first so it separates from the folder.
+        ctx.setLineWidth(7 * s)
+        ctx.setStrokeColor(plateBottom.cgColor)
+        ctx.strokeEllipse(in: R(46, 46, 26, 26))
+        ctx.setLineWidth(4 * s)
+        ctx.setStrokeColor(amberBright.cgColor)
+        ctx.strokeEllipse(in: R(46, 46, 26, 26))
+        ctx.setLineCap(.round)
+        ctx.setLineWidth(6.5 * s)
+        ctx.setStrokeColor(plateBottom.cgColor)
+        ctx.move(to: P(69, 69)); ctx.addLine(to: P(77, 77)); ctx.strokePath()
+        ctx.setLineWidth(4 * s)
+        ctx.setStrokeColor(amberBright.cgColor)
+        ctx.move(to: P(69, 69)); ctx.addLine(to: P(77, 77)); ctx.strokePath()
+
+    case .stack:
+        // Depth: the hierarchy expressed as folders receding behind one another.
+        glow(P(50, 52), plate.width * 0.46, 0.35)
+        folder(34, 22, 34, 26, 3, amberDim)
+        folder(30, 32, 40, 28, 3.5, rgb(226, 160, 40))
+        folder(25, 43, 48, 30, 4, amber)
+
+    case .lanternLit:
+        // The name, literally: a lantern above, a folder in its light.
+        ctx.saveGState()
+        let cone = CGMutablePath()
+        cone.move(to: P(43, 40)); cone.addLine(to: P(20, 78))
+        cone.addLine(to: P(80, 78)); cone.addLine(to: P(57, 40))
+        cone.closeSubpath()
+        ctx.addPath(cone); ctx.clip()
+        ctx.drawLinearGradient(
+            CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                       colors: [rgb(255, 201, 77, 0.55).cgColor,
+                                rgb(255, 201, 77, 0.0).cgColor] as CFArray,
+                       locations: [0, 1])!,
+            start: P(50, 40), end: P(50, 80), options: [])
+        ctx.restoreGState()
+        // Lantern: handle, cap, glowing body.
+        ctx.setStrokeColor(amberBright.cgColor)
+        ctx.setLineWidth(2.6 * s); ctx.setLineCap(.round)
+        ctx.addArc(center: P(50, 22), radius: 6 * s, startAngle: .pi, endAngle: 0, clockwise: false)
+        ctx.strokePath()
+        fill(R(41, 22, 18, 4), 2, amberBright)
+        fill(R(43, 26, 14, 14), 3, amber)
+        glow(P(50, 33), plate.width * 0.22, 0.55)
+        folder(33, 58, 34, 24, 3.5, amber)
+
+    case .drawer:
+        // A filing drawer pulled open, light coming out of the gap.
+        glow(P(50, 56), plate.width * 0.42, 0.38)
+        fill(R(26, 24, 48, 52), 5, rgb(255, 255, 255, 0.13))
+        fill(R(30, 29, 40, 11), 2.5, amberDim)
+        fill(R(30, 62, 40, 11), 2.5, amberDim)
+        // The open drawer sits proud of the cabinet face.
+        fill(R(22, 44, 56, 15), 3, amber)
+        fill(R(42, 50, 16, 3), 1.5, plateBottom)      // handle
+
+    case .openFolder:
+        // Documents rising out of an open folder.
+        glow(P(50, 48), plate.width * 0.46, 0.38)
+        fill(R(26, 34, 48, 32), 4, amberDim)          // back panel
+        fill(R(36, 26, 13, 18), 2, rgb(255, 255, 255, 0.92))
+        fill(R(52, 30, 13, 16), 2, rgb(255, 255, 255, 0.72))
+        fill(R(24, 46, 52, 26), 4, amber)             // front panel
     }
 
+    ctx.restoreGState()
     NSGraphicsContext.restoreGraphicsState()
     return rep
 }
@@ -145,9 +192,8 @@ func png(_ rep: NSBitmapImageRep) -> Data? { rep.representation(using: .png, pro
 
 let args = CommandLine.arguments
 
-// ---- preview mode: every variant on one strip, for choosing ----
 if args.count > 2, args[1] == "--preview" {
-    let tile: CGFloat = 256
+    let tile: CGFloat = 220
     let all = Variant.allCases
     let sheet = NSBitmapImageRep(bitmapDataPlanes: nil,
                                  pixelsWide: Int(tile) * all.count, pixelsHigh: Int(tile),
@@ -157,8 +203,8 @@ if args.count > 2, args[1] == "--preview" {
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: sheet)
     for (i, v) in all.enumerated() {
-        let rep = draw(size: tile, variant: v)
-        rep.draw(in: NSRect(x: CGFloat(i) * tile, y: 0, width: tile, height: tile))
+        draw(size: tile, variant: v)
+            .draw(in: NSRect(x: CGFloat(i) * tile, y: 0, width: tile, height: tile))
     }
     NSGraphicsContext.restoreGraphicsState()
     try? png(sheet)?.write(to: URL(fileURLWithPath: args[2]))
@@ -166,9 +212,8 @@ if args.count > 2, args[1] == "--preview" {
     exit(0)
 }
 
-// ---- normal mode: one variant, full iconset ----
 let outDir = args.count > 1 ? args[1] : "./Lantern.iconset"
-let variant = Variant(rawValue: args.count > 2 ? Int(args[2]) ?? 1 : 1) ?? .warm
+let variant = Variant(rawValue: args.count > 2 ? Int(args[2]) ?? 1 : 1) ?? .panes
 try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
 
 let sizes: [(Int, String)] = [

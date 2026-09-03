@@ -15,8 +15,11 @@ rm -rf "${OUT}" "${ICONSET}"
 mkdir -p "${OUT}/Contents/MacOS" "${OUT}/Contents/Resources"
 
 echo "Generating icon..."
-# Variant 2 = "night": an amber monogram glowing out of a deep navy plate.
-swift "${HERE}/tools/make-icon.swift" "${ICONSET}" 2 >/dev/null
+# Icon variant, by number. Run this to see them all before changing it:
+#   swift tools/make-icon.swift --preview /tmp/variants.png
+# 1 panes  2 magnify  3 stack  4 lantern-lit  5 drawer  6 open-folder
+ICON_VARIANT=2
+swift "${HERE}/tools/make-icon.swift" "${ICONSET}" "${ICON_VARIANT}" >/dev/null
 iconutil --convert icns "${ICONSET}" --output "${OUT}/Contents/Resources/AppIcon.icns"
 
 cat > "${OUT}/Contents/Info.plist" <<PLIST
