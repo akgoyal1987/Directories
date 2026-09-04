@@ -8,9 +8,10 @@
 // Quick Look for previews, NSWorkspace for icons and "Open With", ShareLink for
 // the share sheet, and the system sidebar styling.
 //
-// File operations are limited to the recoverable ones - new folder, rename, and
-// move to Trash. There is deliberately no copy/move engine: that needs progress
-// reporting, conflict resolution and undo, and a half-built one loses data.
+// Every file operation is recoverable. Nothing is ever overwritten -- a name
+// collision becomes "x copy" -- copies and moves run off the main thread behind
+// a progress sheet with a working cancel, and one level of undo puts things back
+// by sending the new copies to the Trash rather than unlinking them.
 
 import SwiftUI
 import AppKit
