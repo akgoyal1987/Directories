@@ -54,6 +54,29 @@ because it rules things out:
   Trash, so a mistaken undo is itself recoverable.
 - **Delete means Trash.** There is no hard delete anywhere in the app.
 
+## Download
+
+Grab the zip from the [Releases](../../releases) page, unzip it, and drag the
+`.app` to `/Applications`. Apple silicon only.
+
+The binary is **ad-hoc signed and not notarised**, so Gatekeeper refuses the
+first launch with "cannot be opened because the developer cannot be verified".
+Either right-click the app and choose Open, or clear the quarantine flag once:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Directories.app
+```
+
+Notarising needs a paid Apple Developer account, which this project does not
+have. If you would rather not take a stranger's binary on trust -- a reasonable
+position -- build from source instead. It takes about ten seconds.
+
+Verify a download against `SHA256SUMS.txt` on the release:
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
 ## Build
 
 Requires the Xcode command line tools (`xcode-select --install`) and macOS 14
@@ -82,6 +105,33 @@ normal per-folder consent every app gets, not a global grant.
 - **No recursive search.** Filtering matches the current folder only; a
   Spotlight-backed search across a subtree is not wired up.
 
+## Related
+
+Two sibling projects, same idea and same constraints -- plain Swift, no
+dependencies, one shell script to build:
+
+- [PlusPad](https://github.com/akgoyal1987/PlusPad) -- a Notepad++-style
+  text editor that never asks you to save
+- [DockToggle](https://github.com/akgoyal1987/DockToggle) -- closing an app's
+  last window quits it, so unpinned icons leave the Dock
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+how the code is laid out and what to run before opening one.
+
+## About
+
+I am **Ankit Goyal**, a software engineer working on data platform and
+distributed systems.
+
+Directories started because I moved to a Mac and kept reaching for the Explorer
+pane that was not there. It turned into an exercise in seeing how far plain
+SwiftUI and AppKit go with no dependencies at all -- the answer was further than
+I expected.
+
+GitHub: [@akgoyal1987](https://github.com/akgoyal1987)
+
 ## Licence
 
-MIT, as with the rest of this repository.
+MIT. See [LICENSE](LICENSE).

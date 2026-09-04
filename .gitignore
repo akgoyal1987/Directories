@@ -1,0 +1,5 @@
+build/
+dist/
+.DS_Store
+*.dSYM/
+.previous-working.swift
