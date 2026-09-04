@@ -1,7 +1,8 @@
 // Directories - a Windows-Explorer-style file navigator for macOS.
 //
 // Left: an expandable folder tree. Right: folder contents as a list or icon grid.
-// Tabs with per-tab history, an editable address bar, live filtering, and a
+// Tabs with per-tab history, an Explorer-style breadcrumb address bar that turns
+// into an editable path field when you click into it, live filtering, and a
 // configurable set of resizable, sortable columns.
 //
 // Where macOS already provides something, it is used rather than reimplemented:
@@ -52,6 +53,18 @@ enum FS {
     }
 
     static func flushIconCache() { iconCache.removeAllObjects() }
+
+    /// The navigable subfolders of a folder, ordered the way the tree orders
+    /// them. Used by the tree and by the address bar's chevron menus.
+    static func subfolders(_ url: URL, showHidden: Bool = false) -> [URL] {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .localizedNameKey]
+        let opts: FileManager.DirectoryEnumerationOptions = showHidden ? [] : [.skipsHiddenFiles]
+        let items = (try? FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: keys, options: opts)) ?? []
+        return items
+            .filter(isNavigableDirectory)
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
 
     /// "rwxr-xr-x" from a POSIX mode.
     static func permissionString(_ mode: Int) -> String {
@@ -188,13 +201,7 @@ final class FileNode: ObservableObject, Identifiable, Hashable {
     }
 
     private func populate() {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .localizedNameKey]
-        let items = (try? FileManager.default.contentsOfDirectory(
-            at: url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
-        children = items
-            .filter(FS.isNavigableDirectory)
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-            .map { FileNode(url: $0) }
+        children = FS.subfolders(url).map { FileNode(url: $0) }
     }
 
     func reload() {
@@ -1315,11 +1322,237 @@ struct EntryMenu: View {
     }
 }
 
+// MARK: - Address bar
+
+/// The address bar, in the two states Explorer gives it.
+///
+/// Unfocused it is a row of breadcrumbs: every component of the path is a button
+/// that navigates to it, and the chevron after a component lists that folder's
+/// subfolders, so stepping sideways does not mean going up first. Clicking the
+/// empty run to the right of the last crumb -- or Go > Open Location -- turns the
+/// strip into the editable path field with the path selected, ready to be
+/// replaced or copied whole. Return commits, Escape reverts, and clicking away
+/// puts the breadcrumbs back.
+///
+/// Both states are pinned to the same height so the toolbar does not shift when
+/// you click into it.
+struct AddressBar: View {
+    @EnvironmentObject var state: AppState
+    @FocusState private var focused: Bool
+    @State private var editing = false
+
+    private static let height: CGFloat = 22
+
+    var body: some View {
+        Group {
+            if editing { field } else { breadcrumbs }
+        }
+        .frame(height: Self.height)
+        // Go > Open Location, which is a request for the editable form.
+        .onChange(of: state.focusAddress) { _, wanted in
+            if wanted { state.focusAddress = false; startEditing() }
+        }
+    }
+
+    // MARK: editable
+
+    private var field: some View {
+        TextField("Path", text: $state.addressText)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12, design: .monospaced))
+            .focused($focused)
+            .onSubmit { state.commitAddress(); stopEditing() }
+            .onExitCommand { state.cancelAddress(); stopEditing() }
+            .onChange(of: focused) { _, isFocused in
+                // Clicking elsewhere means the same as Escape: a path half typed
+                // is not a path, and leaving it on screen would misreport where
+                // the window actually is.
+                if !isFocused { state.cancelAddress(); editing = false }
+            }
+            .onAppear(perform: takeFocus)
+    }
+
+    private func startEditing() {
+        // The field focuses itself as it appears; if it is already up, this is
+        // a second Open Location and only the focus needs renewing.
+        if editing { takeFocus() } else { editing = true }
+    }
+
+    private func stopEditing() {
+        editing = false
+        focused = false
+    }
+
+    private func takeFocus() {
+        focused = true
+        // Explorer hands over the whole path selected, so it can be replaced or
+        // copied in one action. The field only exists once focus has landed, so
+        // the select-all has to wait a turn.
+        DispatchQueue.main.async {
+            NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+        }
+    }
+
+    // MARK: breadcrumbs
+
+    /// Root first, current folder last.
+    private var components: [URL] {
+        guard let folder = state.folder?.standardizedFileURL else { return [] }
+        var list = [folder]
+        var url = folder
+        while url.path != "/" {
+            let parent = url.deletingLastPathComponent().standardizedFileURL
+            guard parent.path != url.path else { break }
+            list.append(parent)
+            url = parent
+        }
+        return list.reversed()
+    }
+
+    private var breadcrumbs: some View {
+        GeometryReader { geo in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 0) {
+                    ForEach(components, id: \.path) { url in
+                        Crumb(url: url) { state.go(url) }
+                        CrumbChevron(folder: url, showHidden: state.showHidden) { state.go($0) }
+                            .frame(width: 15, height: Self.height)
+                    }
+                    // The empty run after the last crumb is what turns the strip
+                    // into a text field, as it does in Explorer. It has to stretch
+                    // to the full width of the bar, or a short path would leave
+                    // nowhere to click.
+                    Color.clear
+                        .frame(minWidth: 30)
+                        .contentShape(Rectangle())
+                        .onTapGesture(perform: startEditing)
+                }
+                .padding(.horizontal, 3)
+                // A deep path scrolls rather than squeezing, and rests at the
+                // trailing end, so the folder you are in is the one on screen.
+                .frame(minWidth: geo.size.width, alignment: .leading)
+            }
+            .defaultScrollAnchor(.trailing)
+        }
+        .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: .textBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 5)
+            .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1))
+    }
+}
+
+/// One path component. Clicking navigates to it.
+private struct Crumb: View {
+    let url: URL
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Text(FS.displayName(url))
+            .font(.system(size: 12))
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(RoundedRectangle(cornerRadius: 4)
+                .fill(hovering ? Color.secondary.opacity(0.18) : Color.clear))
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+            .onTapGesture(perform: action)
+            .help(url.path)
+    }
+}
+
+/// The chevron after a crumb: it opens that folder's subfolders, which is how
+/// Explorer lets you step sideways without going up first.
+///
+/// AppKit rather than a SwiftUI `Menu` because the items are a directory
+/// listing, and SwiftUI builds a menu's contents whenever the surrounding body
+/// is evaluated -- every keystroke in the filter field, among others. That would
+/// read every folder on the path over and over for menus nobody opened.
+/// `menuNeedsUpdate` runs only when one is genuinely about to appear.
+private struct CrumbChevron: NSViewRepresentable {
+    let folder: URL
+    let showHidden: Bool
+    let onPick: (URL) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSButton {
+        let button = ChevronButton()
+        button.image = NSImage(systemSymbolName: "chevron.right",
+                               accessibilityDescription: "Subfolders")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 8, weight: .semibold))
+        button.imagePosition = .imageOnly
+        button.isBordered = false
+        button.title = ""
+        button.contentTintColor = .secondaryLabelColor
+        let menu = NSMenu()
+        menu.delegate = context.coordinator
+        button.menu = menu
+        apply(context.coordinator)
+        return button
+    }
+
+    func updateNSView(_ nsView: NSButton, context: Context) { apply(context.coordinator) }
+
+    private func apply(_ coordinator: Coordinator) {
+        coordinator.folder = folder
+        coordinator.showHidden = showHidden
+        coordinator.onPick = onPick
+    }
+
+    final class Coordinator: NSObject, NSMenuDelegate {
+        var folder = URL(fileURLWithPath: "/")
+        var showHidden = false
+        var onPick: (URL) -> Void = { _ in }
+
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            menu.removeAllItems()
+            let subfolders = FS.subfolders(folder, showHidden: showHidden)
+            guard !subfolders.isEmpty else {
+                let empty = NSMenuItem(title: "No subfolders", action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                menu.addItem(empty)
+                return
+            }
+            for url in subfolders {
+                let item = NSMenuItem(title: FS.displayName(url),
+                                      action: #selector(pick(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = url
+                // A copy, because the cache hands out one shared image per path
+                // and menu items want it at a different size than the rows do.
+                if let icon = FS.icon(url).copy() as? NSImage {
+                    icon.size = NSSize(width: 16, height: 16)
+                    item.image = icon
+                }
+                menu.addItem(item)
+            }
+        }
+
+        @objc private func pick(_ sender: NSMenuItem) {
+            guard let url = sender.representedObject as? URL else { return }
+            onPick(url)
+        }
+    }
+}
+
+/// A borderless button that drops its menu on a plain left click. `NSButton`
+/// only does that for a pull-down `NSPopUpButton`, which brings its own bezel
+/// and title with it.
+private final class ChevronButton: NSButton {
+    override func mouseDown(with event: NSEvent) {
+        guard let menu else { return }
+        menu.popUp(positioning: nil,
+                   at: NSPoint(x: 0, y: isFlipped ? bounds.height : 0),
+                   in: self)
+    }
+}
+
 // MARK: - Main window
 
 struct ContentView: View {
     @EnvironmentObject var state: AppState
-    @FocusState private var addressFocused: Bool
     @State private var panelDropTarget = false
 
     var body: some View {
@@ -1417,16 +1650,7 @@ struct ContentView: View {
             Button { state.up() } label: { Image(systemName: "arrow.up") }
                 .disabled(state.folder?.path == "/").help("Enclosing folder (Cmd+Up)")
 
-            // Editable address bar: type a path, Return to go, Escape to revert.
-            TextField("Path", text: $state.addressText)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 12, design: .monospaced))
-                .focused($addressFocused)
-                .onSubmit { state.commitAddress(); addressFocused = false }
-                .onExitCommand { state.cancelAddress(); addressFocused = false }
-                .onChange(of: state.focusAddress) { _, want in
-                    if want { addressFocused = true; state.focusAddress = false }
-                }
+            AddressBar()
 
             Picker("", selection: Binding(
                 get: { state.viewMode }, set: { state.setViewMode($0) }
