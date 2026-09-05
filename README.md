@@ -107,10 +107,24 @@ because it rules things out:
   the standard-directory list itself, and deriving it also keeps the app
   correct in languages where the name on screen is not the name on disk.
 
+## Requirements
+
+- **macOS 14 Sonoma or later.** The binary is built with a deployment target of
+  14.0, so macOS 13 and earlier refuse to load it -- dyld stops it before any of
+  the app's own code runs, whatever the Finder shows.
+- **Apple silicon.** The released binary is arm64 only. An Intel Mac cannot run
+  it and Rosetta does not help: Rosetta translates Intel code so it runs on
+  Apple silicon, not the other way round. Building from source on an Intel Mac
+  works -- `build.sh` targets whatever machine it is run on.
+
+Tested on macOS 26. The 14.0 floor is what the binary declares rather than
+something that has been exercised on a 14.0 machine, so if it misbehaves on an
+older release, please open an issue.
+
 ## Download
 
 Grab the zip from the [Releases](../../releases) page, unzip it, and drag the
-`.app` to `/Applications`. Apple silicon only.
+`.app` to `/Applications`.
 
 The binary is **ad-hoc signed and not notarised** -- there is no certificate in
 it at all -- so Gatekeeper blocks the first launch with "cannot be opened
@@ -142,8 +156,8 @@ shasum -a 256 -c SHA256SUMS.txt
 
 ## Build
 
-Requires the Xcode command line tools (`xcode-select --install`) and macOS 14
-or later.
+Requires the Xcode command line tools (`xcode-select --install`). Builds on
+Apple silicon and on Intel, producing a binary for the machine it runs on.
 
 ```bash
 ./build.sh --install

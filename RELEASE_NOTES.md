@@ -1,7 +1,14 @@
-# v0.2.0
+# v0.2.1
 
 A folder menu, files you can create, a listing that keeps up with the disk, and
 the folders macOS manages are no longer yours to rename.
+
+**v0.2.0 is withdrawn: its binary only ran on the macOS version that built it.**
+`swiftc` was invoked without `-target`, so it took the deployment target from
+the build machine and stamped the binary minos 26.0 while the Info.plist claimed
+14.0. Launch Services believed the plist and started it; dyld then refused it on
+every Mac older than macOS 26. The build now pins the target, and the two agree.
+No other code changed between 0.2.0 and 0.2.1.
 
 ## New
 
@@ -79,8 +86,17 @@ automated tests.
 
 ## Installing
 
-`Directories-0.2.0-macos-arm64.zip`, macOS 14 or later, Apple silicon only.
-Unzip and drag `Directories.app` to `/Applications`.
+`Directories-0.2.1-macos-arm64.zip`. Unzip and drag `Directories.app` to
+`/Applications`.
+
+- **macOS 14 Sonoma or later.** macOS 13 and earlier refuse to load the binary;
+  dyld stops it before any of the app's own code runs.
+- **Apple silicon.** The released binary is arm64 only. An Intel Mac cannot run
+  it, and Rosetta does not help -- it translates Intel code to run on Apple
+  silicon, not the other way round. Building from source on an Intel Mac works.
+
+Tested on macOS 26. The 14.0 floor is what the binary declares rather than
+something exercised on a 14.0 machine.
 
 The binary is **ad-hoc signed and not notarised** -- there is no certificate in
 it at all -- so Gatekeeper blocks the first launch with "cannot be opened

@@ -6,6 +6,7 @@
 set -euo pipefail
 
 NAME="Directories"
+MIN_MACOS="14.0"
 BUNDLE_ID="com.ankitgoyal.directories"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${HERE}/build/${NAME}.app"
@@ -33,17 +34,25 @@ cat > "${OUT}/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>${NAME}</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.2.0</string>
-    <key>CFBundleVersion</key><string>2</string>
+    <key>CFBundleShortVersionString</key><string>0.2.1</string>
+    <key>CFBundleVersion</key><string>3</string>
     <key>NSHighResolutionCapable</key><true/>
-    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSMinimumSystemVersion</key><string>${MIN_MACOS}</string>
     <key>NSHumanReadableCopyright</key><string>MIT licensed</string>
 </dict>
 </plist>
 PLIST
 
 echo "Compiling..."
-swiftc -O -parse-as-library "${HERE}/Sources/${NAME}/${NAME}.swift" \
+# -target is not optional. Without it swiftc takes the deployment target from
+# whatever the build machine is running, so a Mac on macOS 26 produced a binary
+# stamped minos 26.0 while the Info.plist below claimed 14.0. Launch Services
+# believed the plist and let it start; dyld then refused it, on every Mac older
+# than the one that built it. The architecture follows the host so that building
+# from source works on an Intel Mac as well.
+ARCH="$(uname -m)"
+swiftc -O -parse-as-library -target "${ARCH}-apple-macos${MIN_MACOS}" \
+    "${HERE}/Sources/${NAME}/${NAME}.swift" \
     -o "${OUT}/Contents/MacOS/${NAME}"
 
 # Ad-hoc signature. Replace with a Developer ID for distribution off this Mac.
