@@ -86,6 +86,61 @@ enum FS {
         return URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
     }
 
+    /// The folders macOS manages, asked for rather than named.
+    ///
+    /// Every domain, so this is right whether the app runs as the user or as
+    /// root -- as root the permission checks below stop catching /Applications
+    /// and /Library, and only this list still does.
+    private static let managedDirectories: Set<String> = {
+        let kinds: [FileManager.SearchPathDirectory] = [
+            .desktopDirectory, .documentDirectory, .downloadsDirectory,
+            .libraryDirectory, .moviesDirectory, .musicDirectory,
+            .picturesDirectory, .sharedPublicDirectory, .applicationDirectory,
+            .adminApplicationDirectory, .developerDirectory, .coreServiceDirectory,
+            .userDirectory, .trashDirectory,
+        ]
+        let domains: [FileManager.SearchPathDomainMask] =
+            [.userDomainMask, .localDomainMask, .systemDomainMask]
+        var paths: Set<String> = []
+        for kind in kinds {
+            for domain in domains {
+                for url in FileManager.default.urls(for: kind, in: domain) {
+                    paths.insert(url.standardizedFileURL.path)
+                }
+            }
+        }
+        paths.insert(FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path)
+        return paths
+    }()
+
+    /// Why an item may not be renamed, moved or trashed. nil means it may be.
+    /// The text is written to follow "cannot be renamed because ...".
+    ///
+    /// Finder has no filesystem marker to go on, which is worth knowing before
+    /// looking for one: Desktop, Documents, Downloads and Library carry no
+    /// immutable flag, no Finder name-locked bit and no read-only permission,
+    /// and were measured to be indistinguishable from an ordinary folder by
+    /// every URL resource key there is. What identifies them is the
+    /// standard-directory list itself, so that is what this asks macOS for.
+    /// Deriving the set instead of naming the folders also keeps it correct in
+    /// every language, where the names on screen are not the names on disk.
+    static func protection(for url: URL) -> String? {
+        let standard = url.standardizedFileURL
+        let values = try? standard.resourceValues(
+            forKeys: [.isVolumeKey, .isUserImmutableKey, .isSystemImmutableKey])
+
+        if values?.isVolume == true { return "it is the root of a volume" }
+        if managedDirectories.contains(standard.path) { return "macOS needs this folder" }
+        if values?.isSystemImmutable == true { return "the system has locked it" }
+        if values?.isUserImmutable == true { return "it is locked" }
+
+        let parent = standard.deletingLastPathComponent()
+        if (try? parent.resourceValues(forKeys: [.isWritableKey]))?.isWritable == false {
+            return "the enclosing folder is read-only"
+        }
+        return nil
+    }
+
     /// "rwxr-xr-x" from a POSIX mode.
     static func permissionString(_ mode: Int) -> String {
         let bits = ["r", "w", "x"]
@@ -694,6 +749,21 @@ final class AppState: ObservableObject {
 
     var selectedEntries: [Entry] { rows.filter { selected.contains($0.url) } }
 
+    /// Why the current selection may not be renamed, moved or trashed, taking
+    /// the first reason found. nil when all of it may be.
+    var selectionProtection: String? {
+        selectedEntries.lazy.compactMap { FS.protection(for: $0.url) }.first
+    }
+
+    /// The reason the whole action is refused, naming the item when only some
+    /// of the selection is protected.
+    private func refuse(_ verb: String, _ entries: [Entry]) -> Bool {
+        guard let offender = entries.first(where: { FS.protection(for: $0.url) != nil }),
+              let reason = FS.protection(for: offender.url) else { return false }
+        errorText = "\"\(offender.name)\" cannot be \(verb) because \(reason)."
+        return true
+    }
+
     /// "Copy" for one, "Copy 3 Items" for several, so a menu label says how
     /// much it is about to touch.
     func selectionNoun(_ verb: String) -> String {
@@ -708,7 +778,8 @@ final class AppState: ObservableObject {
     /// rename, and a double-click opens instead -- SwiftUI holds the single tap
     /// back until it knows which it was.
     func nameClicked(_ url: URL, shift: Bool, command: Bool) {
-        if !shift, !command, renaming == nil, selected == [url] {
+        if !shift, !command, renaming == nil, selected == [url],
+           FS.protection(for: url) == nil {
             beginRename()
             return
         }
@@ -982,6 +1053,12 @@ final class AppState: ObservableObject {
 
     func stage(_ urls: [URL], _ mode: ClipboardMode) {
         guard !urls.isEmpty else { return }
+        if mode == .move,
+           let offender = urls.first(where: { FS.protection(for: $0) != nil }),
+           let reason = FS.protection(for: offender) {
+            errorText = "\"\(offender.lastPathComponent)\" cannot be moved because \(reason)."
+            return
+        }
         clipboard = Clipboard(urls: urls, mode: mode)
         // Mirror onto the system pasteboard so Finder and other apps can paste.
         // A cut cannot be expressed there, so cross-app it behaves as a copy.
@@ -1037,6 +1114,11 @@ final class AppState: ObservableObject {
         for url in urls where mode == .move {
             if dest.path == url.path || dest.path.hasPrefix(url.path + "/") {
                 errorText = "Cannot move \"\(url.lastPathComponent)\" into itself."
+                return
+            }
+            // A drag never passes a menu, so the refusal has to live here too.
+            if let reason = FS.protection(for: url) {
+                errorText = "\"\(url.lastPathComponent)\" cannot be moved because \(reason)."
                 return
             }
         }
@@ -1230,6 +1312,7 @@ final class AppState: ObservableObject {
 
     func beginRename() {
         guard let entry = selectedEntries.first else { return }
+        guard !refuse("renamed", [entry]) else { return }
         renaming = entry.url
         renameText = entry.name
     }
@@ -1265,6 +1348,9 @@ final class AppState: ObservableObject {
     func moveToTrash() {
         let targets = selectedEntries
         guard !targets.isEmpty else { return }
+        // Refuse the whole thing rather than trashing the part that is allowed:
+        // a half-done delete is worse to recover from than one that did not run.
+        guard !refuse("moved to the Trash", targets) else { return }
         var failed: [String] = []
         for entry in targets {
             do { try FileManager.default.trashItem(at: entry.url, resultingItemURL: nil) }
@@ -1367,7 +1453,11 @@ struct TreeRow: View {
                 Divider()
                 NewItemMenu(target: node.url)
                 Divider()
-                Button("Cut") { state.stage([node.url], .move) }
+                let blocked = FS.protection(for: node.url)
+                Button(blocked.map { "Cut (\($0))" } ?? "Cut") {
+                    state.stage([node.url], .move)
+                }
+                .disabled(blocked != nil).help(blocked ?? "")
                 Button("Copy") { state.stage([node.url], .copy) }
                 Button("Paste Into Folder") { state.paste(into: node.url) }
                     .disabled(!state.canPaste)
@@ -1819,6 +1909,18 @@ struct EntryMenu: View {
     /// window each, rather than opening fifteen of them. Same limit here.
     private var withinOpenLimit: Bool { count <= AppState.multipleOpenLimit }
 
+    /// Why this selection may not be renamed, moved or trashed; nil when it may.
+    private var blocked: String? {
+        targets.lazy.compactMap { FS.protection(for: $0.url) }.first
+    }
+
+    /// Disabled entries say why in the label as well as the tooltip, so the
+    /// reason is there whether or not the menu chooses to show a tooltip.
+    private func label(_ verb: String) -> String {
+        let base = "\(verb)\(noun)"
+        return blocked.map { "\(base) (\($0))" } ?? base
+    }
+
     var body: some View {
         if withinOpenLimit {
             Button("Open\(noun)") { act { state.openSelection() } }
@@ -1852,7 +1954,8 @@ struct EntryMenu: View {
             Button("Open in Terminal") { state.openTerminal(at: entry.url) }
         }
         Divider()
-        Button("Cut\(noun)") { act { state.cutSelection() } }
+        Button(label("Cut")) { act { state.cutSelection() } }
+            .disabled(blocked != nil).help(blocked ?? "")
         Button("Copy\(noun)") { act { state.copySelection() } }
         if isSingle && entry.isFolder {
             Button("Paste Into Folder") { state.paste(into: entry.url) }.disabled(!state.canPaste)
@@ -1863,7 +1966,8 @@ struct EntryMenu: View {
         Divider()
         ShareLink(items: targets.map(\.url)) { Text("Share\(noun)") }
         if isSingle {
-            Button("Rename") { state.selected = [entry.url]; state.beginRename() }
+            Button(label("Rename")) { state.selected = [entry.url]; state.beginRename() }
+                .disabled(blocked != nil).help(blocked ?? "")
         }
         Divider()
         Button(isSingle ? "Copy Path" : "Copy \(count) Paths") {
@@ -1873,7 +1977,11 @@ struct EntryMenu: View {
             state.copyToPasteboard(targets.map(\.name).joined(separator: "\n"))
         }
         Divider()
-        Button(isSingle ? "Move to Trash" : "Move\(noun) to Trash") { act { state.moveToTrash() } }
+        Button(blocked.map { "Move\(noun) to Trash (\($0))" }
+               ?? (isSingle ? "Move to Trash" : "Move\(noun) to Trash")) {
+            act { state.moveToTrash() }
+        }
+        .disabled(blocked != nil).help(blocked ?? "")
         Divider()
         Button("Refresh") { state.reloadCurrent() }
     }
@@ -2416,7 +2524,9 @@ struct AppCommands: Commands {
 
         CommandGroup(after: .pasteboard) {
             Button(state.selectionNoun("Cut")) { state.cutSelection() }
-                .keyboardShortcut("x").disabled(state.selected.isEmpty)
+                .keyboardShortcut("x")
+                .disabled(state.selected.isEmpty || state.selectionProtection != nil)
+                .help(state.selectionProtection ?? "")
             Button(state.selectionNoun("Copy")) { state.copySelection() }
                 .keyboardShortcut("c").disabled(state.selected.isEmpty)
             Button("Paste") { state.paste() }
@@ -2428,12 +2538,16 @@ struct AppCommands: Commands {
                 .keyboardShortcut("z").disabled(!state.canUndo)
             Divider()
             Button("Select All") { state.selectAll() }.keyboardShortcut("a")
-            Button("Rename") { state.beginRename() }.disabled(state.selected.count != 1)
+            Button("Rename") { state.beginRename() }
+                .disabled(state.selected.count != 1 || state.selectionProtection != nil)
+                .help(state.selectionProtection ?? "")
             Button(state.selected.count > 1
                    ? "Move \(state.selected.count) Items to Trash" : "Move to Trash") {
                 state.moveToTrash()
             }
-            .keyboardShortcut(.delete, modifiers: .command).disabled(state.selected.isEmpty)
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(state.selected.isEmpty || state.selectionProtection != nil)
+            .help(state.selectionProtection ?? "")
         }
 
         CommandMenu("Go") {
