@@ -18,6 +18,7 @@ import SwiftUI
 import AppKit
 import QuickLook
 import UniformTypeIdentifiers
+import CoreServices
 
 // MARK: - Filesystem helpers
 
@@ -64,6 +65,25 @@ enum FS {
         return items
             .filter(isNavigableDirectory)
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    /// The terminal the user actually uses, not whichever one Apple ships.
+    /// First installed candidate wins; `defaults write com.ankitgoyal.directories
+    /// terminalBundleID <id>` overrides the list entirely.
+    static var terminal: URL {
+        let ws = NSWorkspace.shared
+        if let chosen = UserDefaults.standard.string(forKey: "terminalBundleID"),
+           let url = ws.urlForApplication(withBundleIdentifier: chosen) {
+            return url
+        }
+        let candidates = ["com.googlecode.iterm2", "com.mitchellh.ghostty",
+                          "dev.warp.Warp-Stable", "net.kovidgoyal.kitty",
+                          "com.github.wez.wezterm", "org.alacritty",
+                          "co.zeit.hyper", "com.apple.Terminal"]
+        for id in candidates {
+            if let url = ws.urlForApplication(withBundleIdentifier: id) { return url }
+        }
+        return URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
     }
 
     /// "rwxr-xr-x" from a POSIX mode.
@@ -181,6 +201,10 @@ final class FileNode: ObservableObject, Identifiable, Hashable {
     @Published var children: [FileNode] = []
     @Published var isExpanded = false {
         didSet {
+            guard isExpanded != oldValue else { return }
+            // The set of folders being watched for changes follows what is on
+            // screen, and expanding a node puts another folder on screen.
+            NotificationCenter.default.post(name: .treeExpansionChanged, object: nil)
             guard isExpanded, !loaded else { return }
             // Reassigning children synchronously here mutates state SwiftUI is
             // in the middle of reading, which duplicates rows. Defer one tick.
@@ -188,7 +212,9 @@ final class FileNode: ObservableObject, Identifiable, Hashable {
             DispatchQueue.main.async { [weak self] in self?.populate() }
         }
     }
-    private var loaded = false
+    /// Whether the children have ever been read. A collapsed node that has
+    /// never been opened has nothing to reload.
+    private(set) var loaded = false
 
     init(url: URL, label: String? = nil) {
         self.url = url
@@ -200,8 +226,12 @@ final class FileNode: ObservableObject, Identifiable, Hashable {
         populate()
     }
 
+    /// Existing child objects are reused for folders that are still there, so
+    /// a reload triggered by a change on disk leaves the subtree underneath
+    /// expanded and does not make SwiftUI rebuild rows that did not change.
     private func populate() {
-        children = FS.subfolders(url).map { FileNode(url: $0) }
+        let existing = Dictionary(children.map { ($0.url, $0) }, uniquingKeysWith: { a, _ in a })
+        children = FS.subfolders(url).map { existing[$0] ?? FileNode(url: $0) }
     }
 
     func reload() {
@@ -231,6 +261,10 @@ final class FileNode: ObservableObject, Identifiable, Hashable {
 
     static func == (a: FileNode, b: FileNode) -> Bool { a === b }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+extension Notification.Name {
+    static let treeExpansionChanged = Notification.Name("DirectoriesTreeExpansionChanged")
 }
 
 // MARK: - List model
@@ -328,6 +362,131 @@ func sortEntries(_ list: [Entry], by field: SortField, ascending: Bool) -> [Entr
     return folders + files
 }
 
+// MARK: - New item templates
+
+/// The contents of the Explorer-style "New >" submenu. Each entry is created
+/// with the least content that makes the file valid, then handed straight to
+/// inline rename so the name can be typed without a second click.
+struct FileTemplate: Identifiable, Hashable {
+    let label: String
+    let name: String
+    let body: String
+    var executable = false
+    var id: String { name }
+
+    static let all: [FileTemplate] = [
+        FileTemplate(label: "Text Document",     name: "untitled.txt",  body: ""),
+        FileTemplate(label: "Markdown Document", name: "untitled.md",   body: ""),
+        FileTemplate(label: "Shell Script",      name: "untitled.sh",   body: "#!/bin/bash\n",
+                     executable: true),
+        FileTemplate(label: "JSON File",         name: "untitled.json", body: "{\n}\n"),
+        FileTemplate(label: "CSV File",          name: "untitled.csv",  body: ""),
+    ]
+}
+
+// MARK: - Watching the filesystem
+
+/// One FSEvents stream covering every folder currently on screen: the active
+/// tab's folder, plus each expanded node of the tree.
+///
+/// Without this, a listing is only ever re-read when Directories itself changed
+/// something, so a download landing or a `git checkout` stayed invisible until
+/// you navigated away and back.
+///
+/// Three things make it cheap. FSEvents is recursive and cannot be told
+/// otherwise, so watching a folder near the root reports the whole subtree --
+/// events are filtered down to the exact watched paths on a background queue,
+/// and only reach the main queue when a folder actually on screen changed. They
+/// are then coalesced, so a folder receiving five hundred files causes one
+/// reload rather than five hundred. And there is a single stream rather than a
+/// descriptor per folder, so an expanded tree costs one kernel resource.
+final class FolderWatcher {
+    private var stream: FSEventStreamRef?
+    private var watched: Set<String> = []          // main queue only
+
+    private let queue = DispatchQueue(label: "com.ankitgoyal.directories.fsevents")
+    private var accepted: Set<String> = []         // `queue` only: the filter
+    private var pending: Set<String> = []          // `queue` only
+    private var scheduled = false                  // `queue` only
+
+    /// Delivered on the main queue, naming the watched folders that changed.
+    var onChange: (Set<String>) -> Void = { _ in }
+
+    static func normalize(_ path: String) -> String {
+        var p = (path as NSString).standardizingPath
+        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
+        return p
+    }
+
+    func watch(_ paths: [String]) {
+        let set = Set(paths.map(Self.normalize))
+        guard set != watched else { return }
+        stop()
+        watched = set
+        guard !set.isEmpty else { return }
+
+        queue.async { self.accepted = set }
+
+        var context = FSEventStreamContext(
+            version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil, release: nil, copyDescription: nil)
+        // UseCFTypes makes the callback's paths a CFArray of CFStrings. Without
+        // it they arrive as a C array of char*, which cannot be read as an
+        // NSArray however often that trick is repeated.
+        let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes
+                                             | kFSEventStreamCreateFlagNoDefer
+                                             | kFSEventStreamCreateFlagWatchRoot)
+        guard let created = FSEventStreamCreate(
+            kCFAllocatorDefault, fsEventsCallback, &context,
+            Array(set) as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            0.4, flags) else { return }
+
+        stream = created
+        FSEventStreamSetDispatchQueue(created, queue)
+        FSEventStreamStart(created)
+    }
+
+    /// Stopped, invalidated and released, every time. A stream is a kernel
+    /// resource, and the watch set is rebuilt on every navigation -- leaking one
+    /// per folder visited would be a descriptor leak in a process that runs for
+    /// days.
+    func stop() {
+        guard let stream else { return }
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+        self.stream = nil
+        watched = []
+        queue.async { self.accepted = [] }
+    }
+
+    deinit { stop() }
+
+    /// Runs on `queue`.
+    fileprivate func received(_ paths: [String]) {
+        let hits = Set(paths.map(Self.normalize)).intersection(accepted)
+        guard !hits.isEmpty else { return }
+        pending.formUnion(hits)
+        guard !scheduled else { return }
+        scheduled = true
+        queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            let batch = self.pending
+            self.pending = []
+            self.scheduled = false
+            guard !batch.isEmpty else { return }
+            DispatchQueue.main.async { self.onChange(batch) }
+        }
+    }
+}
+
+private let fsEventsCallback: FSEventStreamCallback = { _, info, _, paths, _, _ in
+    guard let info else { return }
+    let watcher = Unmanaged<FolderWatcher>.fromOpaque(info).takeUnretainedValue()
+    watcher.received(unsafeBitCast(paths, to: NSArray.self) as? [String] ?? [])
+}
+
 // MARK: - Clipboard
 
 enum ClipboardMode { case copy, move }
@@ -408,6 +567,13 @@ final class AppState: ObservableObject {
     @Published var previewURL: URL?
     @Published var errorText: String?
 
+    /// Live refresh. The watcher follows what is on screen; a reload asked for
+    /// while a rename field is open or a transfer is running is deferred rather
+    /// than dropped, so it never yanks the field away mid-word.
+    private let watcher = FolderWatcher()
+    private var expansionToken: NSObjectProtocol?
+    private var pendingReload = false
+
     private let defaults = UserDefaults.standard
 
     init() {
@@ -422,6 +588,16 @@ final class AppState: ObservableObject {
            let saved = try? JSONDecoder().decode([Column].self, from: data) {
             columns = saved
         }
+
+        watcher.onChange = { [weak self] changed in self?.foldersChanged(changed) }
+        expansionToken = NotificationCenter.default.addObserver(
+            forName: .treeExpansionChanged, object: nil, queue: .main
+        ) { [weak self] _ in self?.updateWatch() }
+    }
+
+    deinit {
+        watcher.stop()
+        if let expansionToken { NotificationCenter.default.removeObserver(expansionToken) }
     }
 
     private func persist() {
@@ -507,12 +683,73 @@ final class AppState: ObservableObject {
 
     // MARK: navigation
 
+    /// A full re-read that resets the pane: used by navigation, where clearing
+    /// the selection is the right thing. `reloadListing` is the one to call when
+    /// the person has not moved.
     func refresh() {
         guard let folder else { return }
         allRows = readEntries(folder, showHidden: showHidden, posix: needsPOSIX)
         recomputeRows()
         selected = []
         addressText = folder.path
+        pendingReload = false
+        updateWatch()
+    }
+
+    // MARK: live refresh
+
+    /// The folders on screen: the active tab's folder, and every expanded node
+    /// of the tree. Capped, because each watched path widens the subtree
+    /// FSEvents has to report on.
+    private func updateWatch() {
+        var paths: [String] = []
+        if let folder { paths.append(folder.path) }
+        func walk(_ node: FileNode) {
+            guard node.isExpanded else { return }
+            paths.append(node.url.path)
+            node.children.forEach(walk)
+        }
+        (favorites + locations).forEach(walk)
+        watcher.watch(Array(paths.prefix(64)))
+    }
+
+    private func foldersChanged(_ changed: Set<String>) {
+        for path in changed {
+            reloadTreeNode(for: URL(fileURLWithPath: path))
+        }
+        if let folder, changed.contains(FolderWatcher.normalize(folder.path)) {
+            reloadListing()
+        }
+    }
+
+    /// Re-reads the listing without moving anybody: the selection survives for
+    /// everything still on disk, the scroll position is untouched, and no
+    /// navigation happens. This is what a change on disk triggers.
+    func reloadListing() {
+        guard let folder else { return }
+        // Rebuilding the rows under an open rename field takes the field away
+        // mid-word, and re-reading during a transfer fights the transfer's own
+        // refresh. Both replay once they finish.
+        guard renaming == nil, !opRunning else { pendingReload = true; return }
+        let keep = selected
+        allRows = readEntries(folder, showHidden: showHidden, posix: needsPOSIX)
+        recomputeRows()
+        selected = keep.intersection(Set(allRows.map(\.url)))
+        addressText = folder.path
+        updateWatch()
+    }
+
+    /// View > Refresh, and Refresh in the folder menu: re-read both panes now.
+    func reloadCurrent() {
+        guard let folder else { return }
+        reloadListing()
+        reloadTreeNode(for: folder)
+    }
+
+    private func drainPendingReload() {
+        guard pendingReload else { return }
+        pendingReload = false
+        reloadListing()
     }
 
     /// `activate` is the tree row the user clicked, when the navigation came from
@@ -616,7 +853,7 @@ final class AppState: ObservableObject {
 
     func openTerminal(at url: URL? = nil) {
         guard let target = url ?? folder else { return }
-        let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        let terminal = FS.terminal
         NSWorkspace.shared.open([target], withApplicationAt: terminal,
                                 configuration: NSWorkspace.OpenConfiguration())
     }
@@ -722,6 +959,7 @@ final class AppState: ObservableObject {
 
             DispatchQueue.main.async {
                 self.opRunning = false
+                self.pendingReload = false      // the refresh below covers it
                 self.lastOperation = performed
                 if mode == .move { self.clipboard = Clipboard() }
                 self.refresh()
@@ -827,24 +1065,56 @@ final class AppState: ObservableObject {
 
     // MARK: recoverable file operations
 
-    func newFolder() {
-        guard let folder else { return }
-        var name = "untitled folder"
+    /// "untitled.txt", then "untitled 2.txt" -- the number goes before the
+    /// extension, not after it.
+    private func uniqueName(_ proposed: String, in folder: URL) -> String {
+        let stem = (proposed as NSString).deletingPathExtension
+        let ext = (proposed as NSString).pathExtension
+        var name = proposed
         var n = 2
         while FileManager.default.fileExists(atPath: folder.appendingPathComponent(name).path) {
-            name = "untitled folder \(n)"; n += 1
+            name = ext.isEmpty ? "\(stem) \(n)" : "\(stem) \(n).\(ext)"
+            n += 1
         }
-        let target = folder.appendingPathComponent(name)
+        return name
+    }
+
+    /// A new item lands selected and in inline rename, so the name can be typed
+    /// straight away. When it was created somewhere other than the folder being
+    /// browsed -- from the tree's own menu -- only that tree node is reloaded.
+    private func created(_ target: URL, in destination: URL) {
+        reloadTreeNode(for: destination)
+        guard destination == folder else { return }
+        refresh()
+        selected = [target]
+        renaming = target
+        renameText = target.lastPathComponent
+    }
+
+    func newFolder(in destination: URL? = nil) {
+        guard let parent = destination ?? folder else { return }
+        let target = parent.appendingPathComponent(uniqueName("untitled folder", in: parent))
         do {
             try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
-            refresh()
-            reloadTreeNode(for: folder)
-            selected = [target]
-            renaming = target
-            renameText = name
+            created(target, in: parent)
         } catch {
             errorText = "Could not create folder: \(error.localizedDescription)"
         }
+    }
+
+    func newFile(_ template: FileTemplate, in destination: URL? = nil) {
+        guard let parent = destination ?? folder else { return }
+        let name = uniqueName(template.name, in: parent)
+        let target = parent.appendingPathComponent(name)
+        var attributes: [FileAttributeKey: Any] = [:]
+        if template.executable { attributes[.posixPermissions] = 0o755 }
+        guard FileManager.default.createFile(atPath: target.path,
+                                             contents: Data(template.body.utf8),
+                                             attributes: attributes) else {
+            errorText = "Could not create \"\(name)\" here. The folder may not be writable."
+            return
+        }
+        created(target, in: parent)
     }
 
     func beginRename() {
@@ -853,10 +1123,17 @@ final class AppState: ObservableObject {
         renameText = entry.name
     }
 
+    /// The single place a rename field closes, so a reload that arrived while
+    /// it was open gets replayed rather than lost.
+    func endRename() {
+        renaming = nil
+        drainPendingReload()
+    }
+
     func commitRename() {
         guard let url = renaming else { return }
         let newName = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        renaming = nil
+        endRename()
         guard !newName.isEmpty, newName != url.lastPathComponent, !newName.contains("/") else { return }
         let target = url.deletingLastPathComponent().appendingPathComponent(newName)
         guard !FileManager.default.fileExists(atPath: target.path) else {
@@ -887,9 +1164,16 @@ final class AppState: ObservableObject {
         if !failed.isEmpty { errorText = "Could not move to Trash: \(failed.joined(separator: ", "))" }
     }
 
+    /// Reloads every tree node showing this path -- the same folder can appear
+    /// under both Favorites and Locations. A node that has never been opened is
+    /// left alone: it reads itself fresh whenever it is.
     func reloadTreeNode(for url: URL) {
+        let target = FolderWatcher.normalize(url.path)
         func walk(_ node: FileNode) {
-            if node.url == url { node.reload(); return }
+            if FolderWatcher.normalize(node.url.path) == target {
+                if node.loaded { node.reload() }
+                return
+            }
             for child in node.children { walk(child) }
         }
         for node in favorites + locations { walk(node) }
@@ -917,6 +1201,10 @@ final class AppState: ObservableObject {
         filter = ""
         refresh()
     }
+
+    /// Cheap safety net over FSEvents, which is unreliable on network volumes
+    /// and delivers nothing at all while the machine is asleep.
+    func windowBecameActive() { reloadCurrent() }
 
     func toggleSort(_ field: SortField) {
         if sortField == field {
@@ -966,12 +1254,15 @@ struct TreeRow: View {
                 }
                 Button("Open in Terminal") { state.openTerminal(at: node.url) }
                 Divider()
+                NewItemMenu(target: node.url)
+                Divider()
                 Button("Cut") { state.stage([node.url], .move) }
                 Button("Copy") { state.stage([node.url], .copy) }
                 Button("Paste Into Folder") { state.paste(into: node.url) }
                     .disabled(!state.canPaste)
                 Divider()
                 Button("Copy Path") { state.copyToPasteboard(node.url.path) }
+                Button("Refresh") { node.reload() }
             }
         }
         .listRowSeparator(.hidden)     // no rules between tree rows
@@ -1124,6 +1415,70 @@ struct ColumnHeaders: View {
     }
 }
 
+// MARK: - Menus over a folder
+
+/// The "New >" submenu, shared by the folder menu, the tree and the menu bar.
+/// `target` is nil for the folder being browsed.
+struct NewItemMenu: View {
+    @EnvironmentObject var state: AppState
+    var target: URL? = nil
+
+    var body: some View {
+        Menu("New") {
+            Button("Folder") { state.newFolder(in: target) }
+            Divider()
+            ForEach(FileTemplate.all) { template in
+                Button(template.label) { state.newFile(template, in: target) }
+            }
+        }
+    }
+}
+
+/// The background menu: right-click the empty space of the folder pane, the way
+/// Explorer does it. Everything here acts on the folder being browsed rather
+/// than on a selection, which is what makes it useful in an empty folder --
+/// there is no row to aim at.
+struct FolderMenu: View {
+    @EnvironmentObject var state: AppState
+    var target: URL? = nil
+
+    private var subject: URL? { target ?? state.folder }
+
+    var body: some View {
+        NewItemMenu(target: target)
+        Divider()
+        Button("Paste") { state.paste(into: target) }.disabled(!state.canPaste)
+        Button("Select All") { state.selectAll() }
+        Divider()
+        Button("Open in Terminal") { state.openTerminal(at: subject) }
+        Button("Show in Finder") {
+            if let subject {
+                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: subject.path)
+            }
+        }
+        Button("Copy Path") { state.copyToPasteboard(subject?.path ?? "") }
+        Divider()
+        Menu("Sort By") {
+            Button("Name") { state.toggleSort(.name) }
+            ForEach(state.columns, id: \.self) { column in
+                Button(column.label) { state.toggleSort(.column(column)) }
+            }
+        }
+        Menu("View As") {
+            ForEach(ViewMode.allCases, id: \.self) { mode in
+                Button(mode.label) { state.setViewMode(mode) }
+            }
+        }
+        Menu("Columns") { ColumnMenu() }
+        // A leading check mark reads correctly in an AppKit context menu.
+        Button(state.showHidden ? "\u{2713}  Show Hidden Files" : "     Show Hidden Files") {
+            state.toggleHidden()
+        }
+        Divider()
+        Button("Refresh") { state.reloadCurrent() }
+    }
+}
+
 // MARK: - Rows
 
 struct RenameField: View {
@@ -1137,7 +1492,7 @@ struct RenameField: View {
             .focused($focused)
             .onAppear { focused = true }
             .onSubmit { state.commitRename() }
-            .onExitCommand { state.renaming = nil }
+            .onExitCommand { state.endRename() }
     }
 }
 
@@ -1319,6 +1674,8 @@ struct EntryMenu: View {
         Button("Copy Name") { state.copyToPasteboard(entry.name) }
         Divider()
         Button("Move to Trash") { state.selected = [entry.url]; state.moveToTrash() }
+        Divider()
+        Button("Refresh") { state.reloadCurrent() }
     }
 }
 
@@ -1575,6 +1932,10 @@ struct ContentView: View {
                     statusBar
                 }
                 .frame(minWidth: 440)
+                // Right-clicking anywhere that is not a row gets the folder
+                // menu. A row's own menu is nested deeper and so wins over this
+                // one wherever there is a row to hit.
+                .contextMenu { FolderMenu() }
                 // Empty space in the panel targets the folder being browsed, so
                 // a drag from the tree can land without aiming at a row.
                 .onDrop(of: [.fileURL], isTargeted: $panelDropTarget) { providers in
@@ -1592,6 +1953,10 @@ struct ContentView: View {
         }
         .frame(minWidth: 940, minHeight: 540)
         .onAppear { state.start() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)) { _ in
+            state.windowBecameActive()
+        }
         .quickLookPreview($state.previewURL)          // the system preview panel
         .sheet(item: $state.infoTarget) { InfoSheet(entry: $0) }
         .sheet(isPresented: Binding(
@@ -1704,10 +2069,15 @@ struct ContentView: View {
                     ForEach(state.rows) { IconCell(entry: $0) }
                 }
                 .padding(12)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .contentShape(Rectangle())
+                .contextMenu { FolderMenu() }
             }
         }
     }
 
+    /// An empty folder is exactly where the background menu matters most, so
+    /// this carries its own copy rather than relying on the pane's.
     private var emptyState: some View {
         VStack {
             Spacer()
@@ -1716,6 +2086,8 @@ struct ContentView: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, minHeight: 220)
+        .contentShape(Rectangle())
+        .contextMenu { FolderMenu() }
     }
 
     private var statusBar: some View {
@@ -1823,6 +2195,11 @@ struct AppCommands: Commands {
             Button("New Tab") { state.newTab() }.keyboardShortcut("t")
             Button("New Folder") { state.newFolder() }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
+            Menu("New File") {
+                ForEach(FileTemplate.all) { template in
+                    Button(template.label) { state.newFile(template) }
+                }
+            }
             Button("Close Tab") { state.closeTab() }.keyboardShortcut("w")
             Divider()
             Button("Open") { state.openSelection() }
@@ -1896,7 +2273,7 @@ struct AppCommands: Commands {
             Toggle("Show Hidden Files", isOn: Binding(
                 get: { state.showHidden }, set: { _ in state.toggleHidden() }
             )).keyboardShortcut(".", modifiers: [.command, .shift])
-            Button("Refresh") { state.refresh() }.keyboardShortcut("r")
+            Button("Refresh") { state.reloadCurrent() }.keyboardShortcut("r")
         }
     }
 }
