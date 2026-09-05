@@ -694,6 +694,12 @@ final class AppState: ObservableObject {
 
     var selectedEntries: [Entry] { rows.filter { selected.contains($0.url) } }
 
+    /// "Copy" for one, "Copy 3 Items" for several, so a menu label says how
+    /// much it is about to touch.
+    func selectionNoun(_ verb: String) -> String {
+        selected.count > 1 ? "\(verb) \(selected.count) Items" : verb
+    }
+
     /// Every click on a row, from either view. The range runs over `rows`, so it
     /// follows what is on screen: the current sort, and the current filter.
     func click(_ url: URL, shift: Bool, command: Bool) {
@@ -1550,15 +1556,32 @@ struct FolderMenu: View {
 struct RenameField: View {
     @EnvironmentObject var state: AppState
     @FocusState private var focused: Bool
+    /// Escape has to be caught before AppKit's field editor sees it. The editor
+    /// treats it as its own cancel and consumes the event, so `onExitCommand`
+    /// on the text field never fired and Escape did nothing. A local monitor
+    /// runs first. It is created with the field and removed with it, so exactly
+    /// one exists while a rename is open and none otherwise.
+    @State private var escapeMonitor: Any?
 
     var body: some View {
         TextField("", text: $state.renameText)
             .textFieldStyle(.roundedBorder)
             .font(.system(size: 12.5))
             .focused($focused)
-            .onAppear { focused = true }
+            .onAppear {
+                focused = true
+                guard escapeMonitor == nil else { return }
+                escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { event in
+                    guard event.keyCode == 53 else { return event }      // Escape
+                    state.endRename()
+                    return nil
+                }
+            }
+            .onDisappear {
+                if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
+                escapeMonitor = nil
+            }
             .onSubmit { state.commitRename() }
-            .onExitCommand { state.endRename() }
     }
 }
 
@@ -1691,49 +1714,95 @@ struct IconCell: View {
 
 // MARK: - Shared row context menu
 
+/// The row menu, shaped by what is actually selected.
+///
+/// Right-clicking inside a selection acts on all of it; right-clicking outside
+/// one moves the selection to that row first. Both Explorer and the Finder
+/// behave this way.
+///
+/// Anything that only makes sense for a single item, or only for a folder, is
+/// left out rather than shown and quietly doing the wrong thing. That was not
+/// cosmetic: every one of these used to reset the selection to the row under
+/// the cursor first, so "Move to Trash" on five selected files trashed one and
+/// left the other four looking as though they had gone.
 struct EntryMenu: View {
     let entry: Entry
     @EnvironmentObject var state: AppState
 
-    /// Right-clicking a row outside the current selection acts on that row.
-    private func ensureSelected() {
+    /// What the menu will act on: the whole selection when the clicked row is
+    /// part of it, otherwise just that row.
+    private var targets: [Entry] {
+        state.selected.contains(entry.url) ? state.selectedEntries : [entry]
+    }
+    private var count: Int { targets.count }
+    private var isSingle: Bool { count == 1 }
+    private var allFolders: Bool { targets.allSatisfy(\.isFolder) }
+
+    /// Appended to a verb so a label says what it will touch: "Copy 3 Items".
+    private var noun: String { isSingle ? "" : " \(count) Items" }
+
+    /// Right-clicking a row outside the current selection selects it first, so
+    /// the action and the label the person read agree.
+    private func act(_ body: () -> Void) {
         if !state.selected.contains(entry.url) { state.selected = [entry.url] }
+        body()
     }
 
     var body: some View {
-        Button("Open") { state.open(entry) }
-        if entry.isFolder { Button("Open in New Tab") { state.openInNewTab(entry.url) } }
-
-        let apps = state.applications(for: entry.url)
-        if !apps.isEmpty {
-            Menu("Open With") {          // the system's own association list
-                ForEach(apps, id: \.self) { app in
-                    Button(FS.displayName(app)) { state.open(entry.url, with: app) }
+        Button("Open\(noun)") { act { state.openSelection() } }
+        if allFolders {
+            if isSingle {
+                Button("Open in New Tab") { state.openInNewTab(entry.url) }
+            } else {
+                Button("Open in \(count) New Tabs") {
+                    for target in targets { state.openInNewTab(target.url) }
+                }
+            }
+        }
+        if isSingle {
+            let apps = state.applications(for: entry.url)
+            if !apps.isEmpty {
+                Menu("Open With") {          // the system's own association list
+                    ForEach(apps, id: \.self) { app in
+                        Button(FS.displayName(app)) { state.open(entry.url, with: app) }
+                    }
                 }
             }
         }
         Divider()
-        Button("Quick Look") { state.selected = [entry.url]; state.quickLook() }
-        Button("Get Info") { state.infoTarget = entry }
-        Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([entry.url]) }
-        if entry.isFolder { Button("Open in Terminal") { state.openTerminal(at: entry.url) } }
+        // Quick Look and Get Info each show exactly one item, so they only
+        // appear when exactly one is meant.
+        if isSingle {
+            Button("Quick Look") { act { state.quickLook() } }
+            Button("Get Info") { state.infoTarget = entry }
+        }
+        Button("Show in Finder") { act { state.showInFinder() } }
+        if isSingle && entry.isFolder {
+            Button("Open in Terminal") { state.openTerminal(at: entry.url) }
+        }
         Divider()
-        Button("Cut") { ensureSelected(); state.cutSelection() }
-        Button("Copy") { ensureSelected(); state.copySelection() }
-        if entry.isFolder {
+        Button("Cut\(noun)") { act { state.cutSelection() } }
+        Button("Copy\(noun)") { act { state.copySelection() } }
+        if isSingle && entry.isFolder {
             Button("Paste Into Folder") { state.paste(into: entry.url) }.disabled(!state.canPaste)
         } else {
             Button("Paste") { state.paste() }.disabled(!state.canPaste)
         }
-        Button("Duplicate") { ensureSelected(); state.duplicateSelection() }
+        Button("Duplicate\(noun)") { act { state.duplicateSelection() } }
         Divider()
-        ShareLink(item: entry.url) { Text("Share") }
-        Button("Rename") { state.selected = [entry.url]; state.beginRename() }
+        ShareLink(items: targets.map(\.url)) { Text("Share\(noun)") }
+        if isSingle {
+            Button("Rename") { state.selected = [entry.url]; state.beginRename() }
+        }
         Divider()
-        Button("Copy Path") { state.copyToPasteboard(entry.url.path) }
-        Button("Copy Name") { state.copyToPasteboard(entry.name) }
+        Button(isSingle ? "Copy Path" : "Copy \(count) Paths") {
+            state.copyToPasteboard(targets.map(\.url.path).joined(separator: "\n"))
+        }
+        Button(isSingle ? "Copy Name" : "Copy \(count) Names") {
+            state.copyToPasteboard(targets.map(\.name).joined(separator: "\n"))
+        }
         Divider()
-        Button("Move to Trash") { state.selected = [entry.url]; state.moveToTrash() }
+        Button(isSingle ? "Move to Trash" : "Move\(noun) to Trash") { act { state.moveToTrash() } }
         Divider()
         Button("Refresh") { state.reloadCurrent() }
     }
@@ -2264,22 +2333,24 @@ struct AppCommands: Commands {
             Divider()
             Button("Open") { state.openSelection() }
                 .keyboardShortcut(.downArrow, modifiers: .command).disabled(state.selected.isEmpty)
+            // Both show exactly one item, so both need exactly one selected -
+            // with several they used to act on whichever happened to sort first.
             Button("Quick Look") { state.quickLook() }
-                .keyboardShortcut(.space, modifiers: []).disabled(state.selected.isEmpty)
+                .keyboardShortcut(.space, modifiers: []).disabled(state.selected.count != 1)
             Button("Get Info") { state.infoTarget = state.selectedEntries.first }
-                .keyboardShortcut("i").disabled(state.selected.isEmpty)
+                .keyboardShortcut("i").disabled(state.selected.count != 1)
             Button("Open in Terminal") { state.openTerminal() }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
         }
 
         CommandGroup(after: .pasteboard) {
-            Button("Cut") { state.cutSelection() }
+            Button(state.selectionNoun("Cut")) { state.cutSelection() }
                 .keyboardShortcut("x").disabled(state.selected.isEmpty)
-            Button("Copy") { state.copySelection() }
+            Button(state.selectionNoun("Copy")) { state.copySelection() }
                 .keyboardShortcut("c").disabled(state.selected.isEmpty)
             Button("Paste") { state.paste() }
                 .keyboardShortcut("v").disabled(!state.canPaste)
-            Button("Duplicate") { state.duplicateSelection() }
+            Button(state.selectionNoun("Duplicate")) { state.duplicateSelection() }
                 .keyboardShortcut("d").disabled(state.selected.isEmpty)
             Divider()
             Button("Undo Last File Operation") { state.undoLastOperation() }
@@ -2287,8 +2358,11 @@ struct AppCommands: Commands {
             Divider()
             Button("Select All") { state.selectAll() }.keyboardShortcut("a")
             Button("Rename") { state.beginRename() }.disabled(state.selected.count != 1)
-            Button("Move to Trash") { state.moveToTrash() }
-                .keyboardShortcut(.delete, modifiers: .command).disabled(state.selected.isEmpty)
+            Button(state.selected.count > 1
+                   ? "Move \(state.selected.count) Items to Trash" : "Move to Trash") {
+                state.moveToTrash()
+            }
+            .keyboardShortcut(.delete, modifiers: .command).disabled(state.selected.isEmpty)
         }
 
         CommandMenu("Go") {
