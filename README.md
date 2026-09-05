@@ -33,13 +33,53 @@ Explorer and keep reaching for a pane that is not there, this is that pane.
 - **Sort by any visible column**, ascending or descending, Cmd 1 through Cmd 9.
 - **Live filter** as you type, and Cmd Shift `.` for hidden files.
 
+**Selecting**
+
+- **Click** selects, **Cmd-click** toggles, **Shift-click** takes the range.
+  The range measures from the last row clicked without Shift, so shift-clicking
+  a nearer row shrinks it rather than growing it one row at a time. Cmd with
+  Shift adds a second run to what is already selected.
+- The range runs over what is **on screen**, so it follows the current sort and
+  the current filter -- what you clicked between is what you get.
+- **Click the name of a selected item to rename it**, as Explorer and the
+  Finder do. The gesture is on the name itself, so the icon and the rest of the
+  row only ever select and bringing the window forward cannot start a rename by
+  accident. Return commits, Escape cancels.
+
 **Files**
 
-- Cut, Copy, Paste, Duplicate, Rename, New Folder, Move to Trash.
+- Cut, Copy, Paste, Duplicate, Rename, Move to Trash.
+- **New Folder**, and **new files from templates** -- text, Markdown, shell
+  script (created executable), JSON, CSV. A new item arrives selected with its
+  name ready to type.
+- **Right-click empty space for the folder menu**, Explorer's background menu:
+  New, Paste, Select All, Open in Terminal, Show in Finder, Copy Path, Sort By,
+  View As, Columns, Show Hidden Files and Refresh. It is what makes an empty
+  folder usable, since there is no row to aim at.
+- **The row menu follows the selection.** Right-clicking inside a selection
+  acts on all of it and says so -- "Copy 3 Items", "Move 3 Items to Trash".
+  Right-clicking outside one moves the selection to that row first. Anything
+  that shows exactly one thing, or applies only to folders, appears only when
+  it fits what is selected, so a mixed selection of files and folders is never
+  offered a verb that would half apply. Open on several folders gives each one
+  a tab of its own.
 - **Undo Last File Operation** (Cmd Z), one level.
 - Drag and drop, within the app and to and from the Finder.
 - Quick Look on Space, Get Info on Cmd I, Open With using the system's own
   association list, Open in Terminal, Copy Path and Copy Name.
+
+## It notices changes it did not make
+
+A download landing, a `git checkout`, a file written by another app: both panes
+update on their own. No navigating away and back, no collapsing and re-expanding
+a tree node.
+
+One FSEvents stream covers the folders on screen -- the active tab's folder and
+every expanded node of the tree. Events are filtered to those exact paths on a
+background queue and coalesced, so a folder receiving five hundred files causes
+one reload rather than five hundred. A reload that arrives while a rename field
+is open, or during a copy, is deferred and replayed rather than dropped, and the
+selection survives it for everything still on disk. Cmd R forces one.
 
 ## Every file operation is recoverable
 
@@ -53,6 +93,19 @@ because it rules things out:
 - **Undo does not unlink.** It puts things back by moving the new copies to the
   Trash, so a mistaken undo is itself recoverable.
 - **Delete means Trash.** There is no hard delete anywhere in the app.
+- **The folders macOS manages cannot be renamed, moved or trashed.** Desktop,
+  Documents, Downloads, Library and the rest, plus volume roots, items locked
+  in Get Info, and anything whose enclosing folder is read-only. Rename, Cut
+  and Move to Trash are disabled for them and say why in the label and the
+  tooltip -- "Rename (macOS needs this folder)". Their contents stay fully
+  editable: the protection is the folder itself, never what is inside it.
+
+  The set is asked of macOS rather than hardcoded, which is the only way to get
+  it right. Those folders carry no immutable flag, no Finder name-locked bit
+  and no read-only permission -- measured, they are indistinguishable from an
+  ordinary folder by every URL resource key there is. What identifies them is
+  the standard-directory list itself, and deriving it also keeps the app
+  correct in languages where the name on screen is not the name on disk.
 
 ## Download
 
@@ -91,6 +144,18 @@ in `build/`. There is no Xcode project and no package manager -- `build.sh`
 generates the icon, compiles the single source file, writes the `Info.plist` and
 signs the bundle.
 
+## Configuration
+
+Open in Terminal uses the terminal you actually have, checked in order: iTerm2,
+Ghostty, Warp, kitty, WezTerm, Alacritty, Hyper, then Terminal.app. To pin one:
+
+```bash
+defaults write com.ankitgoyal.directories terminalBundleID com.googlecode.iterm2
+```
+
+Everything else -- sort, view mode, visible columns, column widths, hidden files
+-- persists on its own.
+
 ## Permissions
 
 None to run. macOS will prompt the first time the app reads a protected
@@ -101,7 +166,6 @@ normal per-folder consent every app gets, not a global grant.
 
 - **Keyboard navigation is thin.** Arrow keys do not move the selection through
   the list, and there is no type-to-select. This is the biggest gap.
-- **No shift-click range selection.**
 - **No recursive search.** Filtering matches the current folder only; a
   Spotlight-backed search across a subtree is not wired up.
 
