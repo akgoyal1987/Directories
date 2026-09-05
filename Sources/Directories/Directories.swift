@@ -898,7 +898,31 @@ final class AppState: ObservableObject {
         if entry.isFolder { go(entry.url) } else { NSWorkspace.shared.open(entry.url) }
     }
 
-    func openSelection() { selectedEntries.forEach(open) }
+    /// Explorer's Open over a multiple selection gives every folder somewhere
+    /// of its own to be -- a window each, and the window you started in stays
+    /// where it was. Here that is a tab each.
+    ///
+    /// The old version opened each item in turn, and opening a folder navigates
+    /// the current tab, so selecting two folders navigated the one tab twice
+    /// and landed on the second. It looked as though only one had opened.
+    func openSelection() {
+        let targets = selectedEntries
+        guard !targets.isEmpty else { return }
+        let folders = targets.filter(\.isFolder)
+
+        for entry in targets where !entry.isFolder {
+            NSWorkspace.shared.open(entry.url)
+        }
+        if folders.count == 1 {
+            go(folders[0].url)          // as a double-click would
+        } else {
+            for entry in folders { openInNewTab(entry.url) }
+        }
+    }
+
+    /// Explorer stops offering Open once the selection passes fifteen, rather
+    /// than launching that many windows at once. Same limit here.
+    static let multipleOpenLimit = 15
 
     func openInNewTab(_ url: URL) { newTab(); go(url) }
 
@@ -1748,28 +1772,41 @@ struct EntryMenu: View {
         body()
     }
 
+    /// The files in the selection, and whether they are all of one type.
+    /// Explorer offers "Open with" for a run of files that share an extension
+    /// and drops it the moment a folder or a second type joins them.
+    private var files: [Entry] { targets.filter { !$0.isFolder } }
+    private var oneFileType: Bool {
+        files.count == count && !files.isEmpty
+            && Set(files.map { $0.ext.lowercased() }).count == 1
+    }
+
+    /// Past fifteen items Explorer stops offering the verbs that would open a
+    /// window each, rather than opening fifteen of them. Same limit here.
+    private var withinOpenLimit: Bool { count <= AppState.multipleOpenLimit }
+
     var body: some View {
-        Button("Open\(noun)") { act { state.openSelection() } }
-        if allFolders {
-            if isSingle {
-                Button("Open in New Tab") { state.openInNewTab(entry.url) }
-            } else {
-                Button("Open in \(count) New Tabs") {
-                    for target in targets { state.openInNewTab(target.url) }
+        if withinOpenLimit {
+            Button("Open\(noun)") { act { state.openSelection() } }
+            if allFolders {
+                Button(isSingle ? "Open in New Tab" : "Open in \(count) New Tabs") {
+                    act { for target in targets { state.openInNewTab(target.url) } }
                 }
             }
-        }
-        if isSingle {
-            let apps = state.applications(for: entry.url)
-            if !apps.isEmpty {
-                Menu("Open With") {          // the system's own association list
-                    ForEach(apps, id: \.self) { app in
-                        Button(FS.displayName(app)) { state.open(entry.url, with: app) }
+            if oneFileType {
+                let apps = state.applications(for: entry.url)
+                if !apps.isEmpty {
+                    Menu("Open With") {      // the system's own association list
+                        ForEach(apps, id: \.self) { app in
+                            Button(FS.displayName(app)) {
+                                act { for file in files { state.open(file.url, with: app) } }
+                            }
+                        }
                     }
                 }
             }
+            Divider()
         }
-        Divider()
         // Quick Look and Get Info each show exactly one item, so they only
         // appear when exactly one is meant.
         if isSingle {
