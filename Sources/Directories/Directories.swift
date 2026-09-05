@@ -362,6 +362,44 @@ func sortEntries(_ list: [Entry], by field: SortField, ascending: Bool) -> [Entr
     return folders + files
 }
 
+// MARK: - Range selection
+
+/// The rows a Shift-click covers: everything between the anchor and the clicked
+/// row, in the order given. `order` is the order on screen rather than the order
+/// on disk, so a range follows the current sort and the current filter -- what
+/// was clicked between is what gets selected.
+///
+/// nil when either end is no longer on screen, which is the caller's cue to
+/// treat the click as a plain one rather than to select nothing.
+func rangeSelection(from anchor: URL, to target: URL, in order: [URL]) -> Set<URL>? {
+    guard let a = order.firstIndex(of: anchor),
+          let b = order.firstIndex(of: target) else { return nil }
+    return Set(order[min(a, b)...max(a, b)])
+}
+
+// MARK: - Click modifiers
+
+/// The modifier keys as they were when the mouse went down.
+///
+/// `NSEvent.modifierFlags` reports the keyboard *now*, and SwiftUI holds a
+/// single tap back while it waits to see whether a second click follows -- a
+/// quarter of a second, which is long enough to have let go of Shift. Reading
+/// the flags then makes range and toggle clicks miss at random. The mouse-down
+/// event carries the flags that were actually held when the click was made, so
+/// a local monitor records them before the gesture ever runs.
+enum ClickModifiers {
+    private(set) static var current: NSEvent.ModifierFlags = []
+    private static var monitor: Any?
+
+    static func startMonitoring() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { event in
+            current = event.modifierFlags
+            return event
+        }
+    }
+}
+
 // MARK: - New item templates
 
 /// The contents of the Explorer-style "New >" submenu. Each entry is created
@@ -535,6 +573,11 @@ final class AppState: ObservableObject {
     /// re-sort the whole folder.
     @Published private(set) var rows: [Entry] = []
     @Published var selected: Set<URL> = []
+    /// Where a Shift range measures from: the last row clicked without Shift.
+    /// Explorer and the Finder both extend from that fixed point rather than
+    /// from the nearest edge of the current selection, so shift-clicking twice
+    /// re-measures instead of growing a row at a time.
+    private var selectionAnchor: URL?
     @Published var filter = "" { didSet { recomputeRows() } }
     @Published var sortField: SortField = .name { didSet { recomputeRows() } }
     @Published var sortAscending = true { didSet { recomputeRows() } }
@@ -651,9 +694,28 @@ final class AppState: ObservableObject {
 
     var selectedEntries: [Entry] { rows.filter { selected.contains($0.url) } }
 
+    /// Every click on a row, from either view. The range runs over `rows`, so it
+    /// follows what is on screen: the current sort, and the current filter.
+    func click(_ url: URL, shift: Bool, command: Bool) {
+        if shift, let anchor = selectionAnchor,
+           let range = rangeSelection(from: anchor, to: url, in: rows.map(\.url)) {
+            // Command with Shift adds the range instead of replacing the
+            // selection, which is how a second run is picked up.
+            selected = command ? selected.union(range) : range
+            return
+        }
+        if command {
+            if selected.contains(url) { selected.remove(url) } else { selected.insert(url) }
+        } else {
+            selected = [url]
+        }
+        selectionAnchor = url
+    }
+
     // MARK: startup
 
     func start() {
+        ClickModifiers.startMonitoring()
         if activeID == nil { activeID = tabs.first?.id }
         if favorites.isEmpty { buildSidebar() }
         refresh()
@@ -691,6 +753,7 @@ final class AppState: ObservableObject {
         allRows = readEntries(folder, showHidden: showHidden, posix: needsPOSIX)
         recomputeRows()
         selected = []
+        selectionAnchor = nil
         addressText = folder.path
         pendingReload = false
         updateWatch()
@@ -734,7 +797,9 @@ final class AppState: ObservableObject {
         let keep = selected
         allRows = readEntries(folder, showHidden: showHidden, posix: needsPOSIX)
         recomputeRows()
-        selected = keep.intersection(Set(allRows.map(\.url)))
+        let live = Set(allRows.map(\.url))
+        selected = keep.intersection(live)
+        if let anchor = selectionAnchor, !live.contains(anchor) { selectionAnchor = nil }
         addressText = folder.path
         updateWatch()
     }
@@ -1087,6 +1152,7 @@ final class AppState: ObservableObject {
         guard destination == folder else { return }
         refresh()
         selected = [target]
+        selectionAnchor = target
         renaming = target
         renameText = target.lastPathComponent
     }
@@ -1565,11 +1631,8 @@ struct ListRow: View {
     }
 
     private func toggleSelect() {
-        if NSEvent.modifierFlags.contains(.command) {
-            if isSelected { state.selected.remove(entry.url) } else { state.selected.insert(entry.url) }
-        } else {
-            state.selected = [entry.url]
-        }
+        let flags = ClickModifiers.current
+        state.click(entry.url, shift: flags.contains(.shift), command: flags.contains(.command))
     }
 }
 
@@ -1615,11 +1678,8 @@ struct IconCell: View {
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { state.open(entry) }
         .onTapGesture {
-            if NSEvent.modifierFlags.contains(.command) {
-                if isSelected { state.selected.remove(entry.url) } else { state.selected.insert(entry.url) }
-            } else {
-                state.selected = [entry.url]
-            }
+            let flags = ClickModifiers.current
+            state.click(entry.url, shift: flags.contains(.shift), command: flags.contains(.command))
         }
         .contextMenu { EntryMenu(entry: entry) }
         .onDrag {
