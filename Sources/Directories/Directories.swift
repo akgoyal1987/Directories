@@ -700,6 +700,21 @@ final class AppState: ObservableObject {
         selected.count > 1 ? "\(verb) \(selected.count) Items" : verb
     }
 
+    /// A click on the *name* of a row, which is the only part that starts a
+    /// rename. Explorer and the Finder both work this way: the first click
+    /// selects, a later click on the name of the item already selected on its
+    /// own opens the field, and the icon or the row around the name only ever
+    /// selects. A click carrying a modifier is a selection gesture and never a
+    /// rename, and a double-click opens instead -- SwiftUI holds the single tap
+    /// back until it knows which it was.
+    func nameClicked(_ url: URL, shift: Bool, command: Bool) {
+        if !shift, !command, renaming == nil, selected == [url] {
+            beginRename()
+            return
+        }
+        click(url, shift: shift, command: command)
+    }
+
     /// Every click on a row, from either view. The range runs over `rows`, so it
     /// follows what is on screen: the current sort, and the current filter.
     func click(_ url: URL, shift: Bool, command: Bool) {
@@ -1646,7 +1661,13 @@ struct ListRow: View {
                 if state.renaming == entry.url {
                     RenameField()
                 } else {
+                    // The gestures sit on the text rather than on the Group, so
+                    // the rename target is the name itself and not the empty
+                    // run of column beside it.
                     Text(entry.name).lineLimit(1).font(.system(size: 12.5))
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { state.open(entry) }
+                        .onTapGesture { nameTapped() }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1680,6 +1701,11 @@ struct ListRow: View {
     private func toggleSelect() {
         let flags = ClickModifiers.current
         state.click(entry.url, shift: flags.contains(.shift), command: flags.contains(.command))
+    }
+
+    private func nameTapped() {
+        let flags = ClickModifiers.current
+        state.nameClicked(entry.url, shift: flags.contains(.shift), command: flags.contains(.command))
     }
 }
 
@@ -1715,6 +1741,14 @@ struct IconCell: View {
             } else {
                 Text(entry.name).font(.system(size: 11)).multilineTextAlignment(.center)
                     .lineLimit(2).frame(width: 96)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) { state.open(entry) }
+                    .onTapGesture {
+                        let flags = ClickModifiers.current
+                        state.nameClicked(entry.url,
+                                          shift: flags.contains(.shift),
+                                          command: flags.contains(.command))
+                    }
             }
         }
         .padding(7)
