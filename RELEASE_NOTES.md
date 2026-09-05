@@ -82,13 +82,23 @@ automated tests.
 `Directories-0.2.0-macos-arm64.zip`, macOS 14 or later, Apple silicon only.
 Unzip and drag `Directories.app` to `/Applications`.
 
-The binary is **ad-hoc signed and not notarised**, so Gatekeeper refuses the
-first launch with "cannot be opened because the developer cannot be verified".
-Either right-click the app and choose Open, or clear the quarantine flag once:
+The binary is **ad-hoc signed and not notarised** -- there is no certificate in
+it at all -- so Gatekeeper blocks the first launch with "cannot be opened
+because the developer cannot be verified", or occasionally with "is damaged and
+can't be opened", which is the same rejection wearing a worse label.
+
+**macOS 15 and later no longer accept the old right-click-and-Open bypass.**
+Open the app once, let it be blocked, then allow it in System Settings >
+Privacy & Security > Open Anyway. Or clear the quarantine flag from a terminal,
+which works on every version:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Directories.app
 ```
+
+Nothing short of a paid Apple Developer ID and notarisation removes this. A
+self-signed certificate does not help: Gatekeeper trusts it no more than an
+ad-hoc signature.
 
 Notarising needs a paid Apple Developer account, which this project does not
 have. Building from source avoids it entirely and takes about ten seconds.
