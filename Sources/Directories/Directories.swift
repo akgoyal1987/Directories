@@ -1839,7 +1839,10 @@ struct FolderMenu: View {
                 .disabled(!state.canUndo)
             Divider()
         }
-        Button("Open in Terminal") { state.openTerminal(at: subject) }
+        // A shell prompt inside the bin is not a thing anyone wants.
+        if !state.isViewingTrash {
+            Button("Open in Terminal") { state.openTerminal(at: subject) }
+        }
         Button("Show in Finder") {
             if let subject {
                 NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: subject.path)
@@ -1882,7 +1885,32 @@ struct TreeNodeMenu: View {
 
     private var blocked: String? { FS.protection(for: node.url) }
 
+    private var isTrash: Bool {
+        node.url.standardizedFileURL.path == AppState.trashURL.standardizedFileURL.path
+    }
+
     var body: some View {
+        if isTrash { binBody } else { folderBody }
+    }
+
+    /// The bin is not a folder you work in. Creating a file inside it, pasting
+    /// into it, cutting it, renaming it or moving it to the Trash are all
+    /// nonsense there, so none of them are offered -- only the things that
+    /// actually apply to a bin.
+    @ViewBuilder
+    private var binBody: some View {
+        Button("Open in New Tab") { state.openInNewTab(node.url) }
+        Button("Show in Finder") {
+            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: node.url.path)
+        }
+        Divider()
+        Button("Empty Recycle Bin") { state.emptyTrash() }
+        Divider()
+        Button("Refresh") { node.reload() }
+    }
+
+    @ViewBuilder
+    private var folderBody: some View {
         Button("Open in New Tab") { state.openInNewTab(node.url) }
         Button("Show in Finder") {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: node.url.path)
@@ -2178,6 +2206,47 @@ struct EntryMenu: View {
     }
 
     var body: some View {
+        if state.isViewingTrash {
+            binBody
+        } else {
+            normalBody
+        }
+    }
+
+    /// What is left once the verbs that mean nothing for a deleted item are
+    /// taken away.
+    ///
+    /// Opening, renaming, cutting, duplicating, compressing and sharing all
+    /// treat the bin as a folder you work in, and it is not: it is a holding
+    /// area for things on their way out. Windows offers Restore, Cut, Delete
+    /// and Properties there and nothing else. Restore is the one this cannot do
+    /// -- putting a file back needs the original path, which macOS keeps in a
+    /// private Finder database rather than on the file -- so it is absent
+    /// rather than guessed at.
+    @ViewBuilder
+    private var binBody: some View {
+        if isSingle {
+            Button("Quick Look") { act { state.quickLook() } }
+            Button("Get Info") { state.infoTarget = entry }
+        }
+        Button("Show in Finder") { act { state.showInFinder() } }
+        Divider()
+        Button(isSingle ? "Copy Path" : "Copy \(count) Paths") {
+            state.copyToPasteboard(targets.map(\.url.path).joined(separator: "\n"))
+        }
+        Divider()
+        Button(blocked.map { "Delete\(noun) Permanently (\($0))" }
+               ?? "Delete\(noun) Permanently") {
+            act { state.deletePermanently() }
+        }
+        .disabled(blocked != nil).help(blocked ?? "")
+        Button("Empty Recycle Bin") { state.emptyTrash() }
+        Divider()
+        Button("Refresh") { state.reloadCurrent() }
+    }
+
+    @ViewBuilder
+    private var normalBody: some View {
         if withinOpenLimit {
             Button("Open\(noun)") { act { state.openSelection() } }
             if allFolders {
@@ -2238,31 +2307,19 @@ struct EntryMenu: View {
             state.copyToPasteboard(targets.map(\.name).joined(separator: "\n"))
         }
         Divider()
-        // Inside the bin the items are already deleted, so there is nowhere
-        // left to move them to and the only delete that means anything is the
-        // permanent one. Everywhere else it is the only delete NOT offered.
-        if state.isViewingTrash {
-            Button(blocked.map { "Delete\(noun) Permanently (\($0))" }
-                   ?? "Delete\(noun) Permanently") {
-                act { state.deletePermanently() }
-            }
-            .disabled(blocked != nil).help(blocked ?? "")
-            Button("Empty Recycle Bin") { state.emptyTrash() }
-        } else {
-            Button(blocked.map { "Move\(noun) to Trash (\($0))" }
-                   ?? (isSingle ? "Move to Trash" : "Move\(noun) to Trash")) {
-                act { state.moveToTrash() }
-            }
-            .disabled(blocked != nil).help(blocked ?? "")
-            // Explorer swaps this item in when Shift is held. A SwiftUI menu
-            // cannot see the modifier, so it is listed with its shortcut
-            // instead of hidden behind a key nobody would guess.
-            Button(blocked.map { "Delete\(noun) Permanently (\($0))" }
-                   ?? "Delete\(noun) Permanently") {
-                act { state.deletePermanently() }
-            }
-            .disabled(blocked != nil).help(blocked ?? "")
+        Button(blocked.map { "Move\(noun) to Trash (\($0))" }
+               ?? (isSingle ? "Move to Trash" : "Move\(noun) to Trash")) {
+            act { state.moveToTrash() }
         }
+        .disabled(blocked != nil).help(blocked ?? "")
+        // Explorer swaps this item in when Shift is held. A SwiftUI menu cannot
+        // see the modifier, so it is listed with its shortcut rather than
+        // hidden behind a key nobody would guess.
+        Button(blocked.map { "Delete\(noun) Permanently (\($0))" }
+               ?? "Delete\(noun) Permanently") {
+            act { state.deletePermanently() }
+        }
+        .disabled(blocked != nil).help(blocked ?? "")
         Divider()
         Button("Refresh") { state.reloadCurrent() }
     }

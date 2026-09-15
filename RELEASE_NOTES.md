@@ -1,53 +1,30 @@
-# v0.4.0
+# v0.4.1
 
-Context menus filled out to match Explorer, Recycle Bin actions, and a
-permanent delete that asks first.
+The Recycle Bin's menus now offer only what applies to a bin.
 
-## Recycle Bin actions
+Every context menu in the app was written for folders you work in, and the bin
+is not one: it is a holding area for things on their way out. Opening, renaming,
+cutting, duplicating, compressing, sharing, pasting into it, creating a new file
+inside it, or moving it to the Trash are all nonsense there, and all of them
+were being offered.
 
-- **Empty Recycle Bin**, from the bin's own background menu or from any row in
-  it. It says how many items will go and defaults to Cancel.
-- **Delete Permanently** on a selection inside the bin. Inside the bin the items
-  are already deleted, so there is nowhere left to move them to and the only
-  delete that means anything is the permanent one.
+- **A row in the bin** now offers Quick Look, Get Info, Show in Finder, Copy
+  Path, Delete Permanently, Empty Recycle Bin and Refresh. Windows offers
+  Restore, Cut, Delete and Properties and nothing else.
+- **The bin in the sidebar** offers Open in New Tab, Show in Finder, Empty
+  Recycle Bin and Refresh. It no longer offers New, Paste Into Folder, Cut,
+  Copy, Rename or Move to Trash.
+- **The bin's background** keeps the view options -- sorting, columns, hidden
+  files -- and drops Open in Terminal.
 
-## Compress to ZIP
-
-On any selection, as Explorer's "Compress to ZIP file" does. One item goes
-through `ditto`, which keeps symlinks, resource forks and the code signature --
-a zipped `.app` made any other way often will not launch. Several items go
-through `zip`. The archive never overwrites: a name already taken becomes
-"x copy", the same rule every other transfer here follows, and Undo puts the new
-archive in the Trash.
-
-## Shift-Delete
-
-Cmd Shift Delete deletes without going through the Trash, which is Windows'
-Shift+Delete. Command is added because Delete alone is a text key on a Mac and
-Cmd Delete is already Move to Trash. It always asks first: it is the one gesture
-in the app that cannot be undone, and it sits one modifier away from the one
-that can.
-
-## Fuller menus
-
-- **The tree** gains Get Info, Rename and Move to Trash, which Explorer's
-  navigation pane has had all along.
-- **The folder background** gains Undo Last File Operation.
-- The bin's background menu drops New and Paste, which mean nothing there.
-
-## A note on "no hard delete"
-
-Earlier versions said there was no hard delete anywhere in the app, and that was
-true. It is not any more: a Recycle Bin you cannot empty is half a bin. The
-principle it was protecting is intact -- Delete still means Trash, Undo still
-puts copies in the Trash rather than unlinking them, and nothing is ever
-overwritten. Permanent deletion now exists in exactly two places, both asking
-first. The README says so rather than keeping a claim that had stopped being
-true.
+Restore, which Windows does have, is deliberately absent rather than guessed at:
+putting a file back needs its original path, and macOS keeps that in a private
+Finder database rather than on the file itself. Dragging an item out of the bin
+works in the meantime.
 
 ## Installing
 
-`Directories-0.4.0-macos-arm64.zip`, macOS 14 or later, Apple silicon only.
+`Directories-0.4.1-macos-arm64.zip`, macOS 14 or later, Apple silicon only.
 Unzip and drag `Directories.app` to `/Applications`.
 
 Ad-hoc signed and not notarised, so Gatekeeper refuses the first launch. Either

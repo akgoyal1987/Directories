@@ -59,7 +59,11 @@ Explorer and keep reaching for a pane that is not there, this is that pane.
   zipped `.app` keeps its symlinks, resource forks and signature and still
   launches; several go through `zip`.
 - **Recycle Bin actions**: Empty Recycle Bin, and Delete Permanently on a
-  selection inside the bin, where there is nowhere left to move things to.
+  selection inside the bin, where there is nowhere left to move things to. The
+  bin's menus offer only what applies to a bin -- no New, no Paste, no Rename,
+  no Compress. Restore is absent rather than guessed at: putting a file back
+  needs its original path, and macOS keeps that in a private Finder database
+  rather than on the file. Drag an item out of the bin in the meantime.
 - **New Folder**, and **new files from templates** -- text, Markdown, shell
   script (created executable), JSON, CSV. A new item arrives selected with its
   name ready to type.
