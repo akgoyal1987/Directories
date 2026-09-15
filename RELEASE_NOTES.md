@@ -1,43 +1,57 @@
-# v0.3.0
+# v0.4.0
 
-A Recycle Bin in the sidebar, and a fix for a list that could hide every
-filename.
+Context menus filled out to match Explorer, Recycle Bin actions, and a
+permanent delete that asks first.
 
-## Recycle Bin
+## Recycle Bin actions
 
-`~/.Trash` now appears at the bottom of Locations, as the Recycle Bin does in
-Explorer. It is the real Trash, so what shows here is what the Finder shows.
+- **Empty Recycle Bin**, from the bin's own background menu or from any row in
+  it. It says how many items will go and defaults to Cancel.
+- **Delete Permanently** on a selection inside the bin. Inside the bin the items
+  are already deleted, so there is nowhere left to move them to and the only
+  delete that means anything is the permanent one.
 
-Browsing only: there is deliberately no Empty Trash. Every delete in this app
-moves to the Trash precisely so it can be undone, and an Empty command would be
-the one place that destroys something for good. The Finder already has it for
-anyone who wants it.
+## Compress to ZIP
 
-macOS guards `~/.Trash` behind Full Disk Access and, unlike Desktop or
-Documents, never prompts for it -- the read simply returns nothing. So until
-that is granted the folder would read as empty, which is indistinguishable from
-an empty bin. The app now tells you which it is, and offers a button straight to
-the right settings pane.
+On any selection, as Explorer's "Compress to ZIP file" does. One item goes
+through `ditto`, which keeps symlinks, resource forks and the code signature --
+a zipped `.app` made any other way often will not launch. Several items go
+through `zip`. The archive never overwrites: a name already taken becomes
+"x copy", the same rule every other transfer here follows, and Undo puts the new
+archive in the Trash.
 
-## Fixed
+## Shift-Delete
 
-- **The list could show no filenames at all.** The name column is the only
-  flexible one, so when the chosen columns were together wider than the window,
-  SwiftUI took the whole difference out of that one view and squeezed it to
-  nothing: a list of icons, sizes, kinds and dates with every name blank, header
-  included. It depended on window width, which is why it came and went. The name
-  now has a floor and the columns to its right run off the edge instead --
-  Explorer's trade, and the right one, because the name is the thing you are
-  reading.
+Cmd Shift Delete deletes without going through the Trash, which is Windows'
+Shift+Delete. Command is added because Delete alone is a text key on a Mac and
+Cmd Delete is already Move to Trash. It always asks first: it is the one gesture
+in the app that cannot be undone, and it sits one modifier away from the one
+that can.
+
+## Fuller menus
+
+- **The tree** gains Get Info, Rename and Move to Trash, which Explorer's
+  navigation pane has had all along.
+- **The folder background** gains Undo Last File Operation.
+- The bin's background menu drops New and Paste, which mean nothing there.
+
+## A note on "no hard delete"
+
+Earlier versions said there was no hard delete anywhere in the app, and that was
+true. It is not any more: a Recycle Bin you cannot empty is half a bin. The
+principle it was protecting is intact -- Delete still means Trash, Undo still
+puts copies in the Trash rather than unlinking them, and nothing is ever
+overwritten. Permanent deletion now exists in exactly two places, both asking
+first. The README says so rather than keeping a claim that had stopped being
+true.
 
 ## Installing
 
-`Directories-0.3.0-macos-arm64.zip`, macOS 14 or later, Apple silicon only.
+`Directories-0.4.0-macos-arm64.zip`, macOS 14 or later, Apple silicon only.
 Unzip and drag `Directories.app` to `/Applications`.
 
-The binary is **ad-hoc signed and not notarised**, so Gatekeeper refuses the
-first launch with "cannot be opened because the developer cannot be verified".
-Either right-click the app and choose Open, or clear the quarantine flag once:
+Ad-hoc signed and not notarised, so Gatekeeper refuses the first launch. Either
+right-click the app and choose Open, or clear the quarantine flag once:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Directories.app

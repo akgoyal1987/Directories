@@ -339,6 +339,19 @@ struct Entry: Identifiable, Hashable {
     let owner: String
     let permissions: String
 
+    /// Read one item from disk. `readEntries` builds these in bulk for a
+    /// listing; the tree has no listing behind it, so Get Info on a tree node
+    /// needs to stat the one path it has.
+    static func read(_ url: URL, posix: Bool = true) -> Entry {
+        readEntries(url.deletingLastPathComponent(), showHidden: true, posix: posix)
+            .first { $0.url.standardizedFileURL == url.standardizedFileURL }
+            ?? Entry(url: url, name: FS.displayName(url),
+                     isFolder: FS.isNavigableDirectory(url), isBundle: false,
+                     size: 0, modified: .distantPast, created: .distantPast,
+                     added: .distantPast, kind: "", ext: url.pathExtension,
+                     owner: "", permissions: "")
+    }
+
     func text(for column: Column) -> String {
         switch column {
         case .size:        return (isFolder || isBundle)
@@ -1371,6 +1384,156 @@ final class AppState: ObservableObject {
     }
 
     /// Trash, never unlink - every deletion stays recoverable from the Finder.
+    /// Compress the selection into a zip beside it, as Explorer's "Compress to
+    /// ZIP file" and the Finder's "Compress" both do.
+    ///
+    /// One item goes through `ditto`, which keeps symlinks, resource forks and
+    /// the code signature of a bundle -- a zipped .app made any other way often
+    /// will not launch. Several items go through `zip`, because ditto archives
+    /// exactly one source; the trade is that a multi-item archive does not
+    /// preserve resource forks, which is what the Finder does too.
+    ///
+    /// The destination never overwrites: a name that is taken becomes "x copy",
+    /// the same rule every other transfer in this app follows.
+    func compressSelection() {
+        let targets = selectedEntries
+        guard !targets.isEmpty, let folder else { return }
+        let base = targets.count == 1
+            ? targets[0].url.deletingPathExtension().lastPathComponent
+            : "Archive"
+        let destination = Self.uniqueDestination(
+            for: folder.appendingPathComponent(base + ".zip"), in: folder)
+        let names = targets.map(\.url.lastPathComponent)
+
+        opRunning = true
+        opTotal = 1
+        opDone = 0
+        opCurrent = destination.lastPathComponent
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let process = Process()
+            if names.count == 1 {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+                process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent",
+                                     names[0], destination.path]
+            } else {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+                process.arguments = ["-r", "-q", "-X", destination.path] + names
+            }
+            process.currentDirectoryURL = folder
+            // Output goes nowhere rather than into a pipe nobody drains: a full
+            // pipe buffer would block the process forever.
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+
+            var failure: String?
+            do {
+                try process.run()
+                process.waitUntilExit()
+                if process.terminationStatus != 0 {
+                    failure = "the archiver reported an error"
+                }
+            } catch {
+                failure = error.localizedDescription
+            }
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.opRunning = false
+                self.opDone = 1
+                if let failure {
+                    self.errorText = "Could not compress: \(failure)"
+                } else {
+                    // Undo puts the new archive in the Trash, like every other
+                    // operation here: undo is itself recoverable.
+                    self.lastOperation = [(from: destination, to: destination, mode: .copy)]
+                }
+                self.refresh()
+                self.selected = [destination]
+            }
+        }
+    }
+
+    /// The Recycle Bin's real location.
+    static let trashURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".Trash")
+
+    /// True when the pane is showing the bin, which is the only place the two
+    /// permanent-delete verbs are offered.
+    var isViewingTrash: Bool {
+        folder?.standardizedFileURL.path == Self.trashURL.standardizedFileURL.path
+    }
+
+    /// Empty the bin.
+    ///
+    /// This is the one place in the app that destroys something for good, and it
+    /// exists because a Recycle Bin you cannot empty is half a bin. Everywhere
+    /// else, delete means Trash precisely so it can be undone. It asks first,
+    /// says how many items and how much space, and defaults to Cancel.
+    func emptyTrash() {
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: Self.trashURL, includingPropertiesForKeys: [.fileSizeKey],
+            options: [])) ?? []
+        guard !contents.isEmpty else {
+            errorText = "The Recycle Bin is already empty, or macOS will not let "
+                + "Directories read it. Granting Full Disk Access fixes the second one."
+            return
+        }
+        let count = contents.count
+        guard confirmDestructive(
+            title: "Empty the Recycle Bin?",
+            body: "\(count) item\(count == 1 ? "" : "s") will be deleted immediately. "
+                + "This cannot be undone.",
+            verb: "Empty Recycle Bin") else { return }
+
+        var failed: [String] = []
+        for url in contents {
+            do { try FileManager.default.removeItem(at: url) }
+            catch { failed.append(url.lastPathComponent) }
+        }
+        refresh()
+        if !failed.isEmpty {
+            errorText = "Could not delete: \(failed.joined(separator: ", "))"
+        }
+    }
+
+    /// Delete the selection outright. Offered only inside the bin, where the
+    /// items are already deleted and the Trash is not somewhere left to put them.
+    func deletePermanently() {
+        let targets = selectedEntries
+        guard !targets.isEmpty else { return }
+        guard !refuse("deleted", targets) else { return }
+        let names = targets.count == 1 ? "\"\(targets[0].name)\""
+            : "\(targets.count) items"
+        guard confirmDestructive(
+            title: "Delete \(names) permanently?",
+            body: "This deletes immediately and cannot be undone.",
+            verb: "Delete") else { return }
+
+        var failed: [String] = []
+        for entry in targets {
+            do { try FileManager.default.removeItem(at: entry.url) }
+            catch { failed.append(entry.name) }
+        }
+        refresh()
+        if !failed.isEmpty {
+            errorText = "Could not delete: \(failed.joined(separator: ", "))"
+        }
+    }
+
+    /// A modal that defaults to Cancel and marks the destructive button as such,
+    /// so Return does the safe thing.
+    private func confirmDestructive(title: String, body: String, verb: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = body
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Cancel")
+        let destructive = alert.addButton(withTitle: verb)
+        destructive.hasDestructiveAction = true
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
     func moveToTrash() {
         let targets = selectedEntries
         guard !targets.isEmpty else { return }
@@ -1470,27 +1633,7 @@ struct TreeRow: View {
             .foregroundStyle(isCurrent ? Color.accentColor : Color.primary)
             .contentShape(Rectangle())
             .onTapGesture { state.go(node.url, activate: node) }
-            .contextMenu {
-                Button("Open in New Tab") { state.openInNewTab(node.url) }
-                Button("Show in Finder") {
-                    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: node.url.path)
-                }
-                Button("Open in Terminal") { state.openTerminal(at: node.url) }
-                Divider()
-                NewItemMenu(target: node.url)
-                Divider()
-                let blocked = FS.protection(for: node.url)
-                Button(blocked.map { "Cut (\($0))" } ?? "Cut") {
-                    state.stage([node.url], .move)
-                }
-                .disabled(blocked != nil).help(blocked ?? "")
-                Button("Copy") { state.stage([node.url], .copy) }
-                Button("Paste Into Folder") { state.paste(into: node.url) }
-                    .disabled(!state.canPaste)
-                Divider()
-                Button("Copy Path") { state.copyToPasteboard(node.url.path) }
-                Button("Refresh") { node.reload() }
-            }
+            .contextMenu { TreeNodeMenu(node: node) }
         }
         .listRowSeparator(.hidden)     // no rules between tree rows
         .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
@@ -1681,11 +1824,21 @@ struct FolderMenu: View {
     private var subject: URL? { target ?? state.folder }
 
     var body: some View {
-        NewItemMenu(target: target)
-        Divider()
-        Button("Paste") { state.paste(into: target) }.disabled(!state.canPaste)
-        Button("Select All") { state.selectAll() }
-        Divider()
+        // The bin is not a folder you put things in, so the verbs that would
+        // create or paste into it are not offered there.
+        if state.isViewingTrash {
+            Button("Empty Recycle Bin") { state.emptyTrash() }
+            Button("Select All") { state.selectAll() }
+            Divider()
+        } else {
+            NewItemMenu(target: target)
+            Divider()
+            Button("Paste") { state.paste(into: target) }.disabled(!state.canPaste)
+            Button("Select All") { state.selectAll() }
+            Button("Undo Last File Operation") { state.undoLastOperation() }
+                .disabled(!state.canUndo)
+            Divider()
+        }
         Button("Open in Terminal") { state.openTerminal(at: subject) }
         Button("Show in Finder") {
             if let subject {
@@ -1716,6 +1869,64 @@ struct FolderMenu: View {
 }
 
 // MARK: - Rows
+
+/// The tree's context menu.
+///
+/// A separate view rather than an inline `.contextMenu { }` because SwiftUI
+/// builders are type-checked as a single expression, and this one grew past
+/// what the compiler will solve in reasonable time -- it fails with "unable to
+/// type-check this expression" rather than anything about the menu.
+struct TreeNodeMenu: View {
+    let node: FileNode
+    @EnvironmentObject var state: AppState
+
+    private var blocked: String? { FS.protection(for: node.url) }
+
+    var body: some View {
+        Button("Open in New Tab") { state.openInNewTab(node.url) }
+        Button("Show in Finder") {
+            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: node.url.path)
+        }
+        Button("Open in Terminal") { state.openTerminal(at: node.url) }
+        Divider()
+        NewItemMenu(target: node.url)
+        Divider()
+        clipboardSection
+        Divider()
+        Button("Copy Path") { state.copyToPasteboard(node.url.path) }
+        Button("Get Info") { state.infoTarget = Entry.read(node.url) }
+        Divider()
+        destructiveSection
+        Divider()
+        Button("Refresh") { node.reload() }
+    }
+
+    @ViewBuilder
+    private var clipboardSection: some View {
+        Button(blocked.map { "Cut (\($0))" } ?? "Cut") { state.stage([node.url], .move) }
+            .disabled(blocked != nil).help(blocked ?? "")
+        Button("Copy") { state.stage([node.url], .copy) }
+        Button("Paste Into Folder") { state.paste(into: node.url) }
+            .disabled(!state.canPaste)
+    }
+
+    @ViewBuilder
+    private var destructiveSection: some View {
+        Button(blocked.map { "Rename (\($0))" } ?? "Rename") {
+            // Renaming happens in the list, so the folder has to be showing
+            // before the field can open on it.
+            state.go(node.url.deletingLastPathComponent())
+            state.selected = [node.url]
+            state.beginRename()
+        }
+        .disabled(blocked != nil).help(blocked ?? "")
+        Button(blocked.map { "Move to Trash (\($0))" } ?? "Move to Trash") {
+            state.selected = [node.url]
+            state.moveToTrash()
+        }
+        .disabled(blocked != nil).help(blocked ?? "")
+    }
+}
 
 struct RenameField: View {
     @EnvironmentObject var state: AppState
@@ -2008,6 +2219,11 @@ struct EntryMenu: View {
             Button("Paste") { state.paste() }.disabled(!state.canPaste)
         }
         Button("Duplicate\(noun)") { act { state.duplicateSelection() } }
+        if !state.isViewingTrash {
+            Button(isSingle ? "Compress to ZIP" : "Compress \(count) Items to ZIP") {
+                act { state.compressSelection() }
+            }
+        }
         Divider()
         ShareLink(items: targets.map(\.url)) { Text("Share\(noun)") }
         if isSingle {
@@ -2022,11 +2238,31 @@ struct EntryMenu: View {
             state.copyToPasteboard(targets.map(\.name).joined(separator: "\n"))
         }
         Divider()
-        Button(blocked.map { "Move\(noun) to Trash (\($0))" }
-               ?? (isSingle ? "Move to Trash" : "Move\(noun) to Trash")) {
-            act { state.moveToTrash() }
+        // Inside the bin the items are already deleted, so there is nowhere
+        // left to move them to and the only delete that means anything is the
+        // permanent one. Everywhere else it is the only delete NOT offered.
+        if state.isViewingTrash {
+            Button(blocked.map { "Delete\(noun) Permanently (\($0))" }
+                   ?? "Delete\(noun) Permanently") {
+                act { state.deletePermanently() }
+            }
+            .disabled(blocked != nil).help(blocked ?? "")
+            Button("Empty Recycle Bin") { state.emptyTrash() }
+        } else {
+            Button(blocked.map { "Move\(noun) to Trash (\($0))" }
+                   ?? (isSingle ? "Move to Trash" : "Move\(noun) to Trash")) {
+                act { state.moveToTrash() }
+            }
+            .disabled(blocked != nil).help(blocked ?? "")
+            // Explorer swaps this item in when Shift is held. A SwiftUI menu
+            // cannot see the modifier, so it is listed with its shortcut
+            // instead of hidden behind a key nobody would guess.
+            Button(blocked.map { "Delete\(noun) Permanently (\($0))" }
+                   ?? "Delete\(noun) Permanently") {
+                act { state.deletePermanently() }
+            }
+            .disabled(blocked != nil).help(blocked ?? "")
         }
-        .disabled(blocked != nil).help(blocked ?? "")
         Divider()
         Button("Refresh") { state.reloadCurrent() }
     }
@@ -2608,6 +2844,18 @@ struct AppCommands: Commands {
                 state.moveToTrash()
             }
             .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(state.selected.isEmpty || state.selectionProtection != nil)
+            .help(state.selectionProtection ?? "")
+            // Windows' Shift+Delete, with Command added because Delete alone is
+            // a text key on a Mac and Command+Delete is already the trash. It
+            // always asks first: this is the one gesture in the app that cannot
+            // be undone, and it is one modifier away from the one that can.
+            Button(state.selected.count > 1
+                   ? "Delete \(state.selected.count) Items Permanently"
+                   : "Delete Permanently") {
+                state.deletePermanently()
+            }
+            .keyboardShortcut(.delete, modifiers: [.command, .shift])
             .disabled(state.selected.isEmpty || state.selectionProtection != nil)
             .help(state.selectionProtection ?? "")
         }

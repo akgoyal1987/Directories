@@ -55,6 +55,11 @@ Explorer and keep reaching for a pane that is not there, this is that pane.
 **Files**
 
 - Cut, Copy, Paste, Duplicate, Rename, Move to Trash.
+- **Compress to ZIP**, on any selection. One item goes through `ditto`, so a
+  zipped `.app` keeps its symlinks, resource forks and signature and still
+  launches; several go through `zip`.
+- **Recycle Bin actions**: Empty Recycle Bin, and Delete Permanently on a
+  selection inside the bin, where there is nowhere left to move things to.
 - **New Folder**, and **new files from templates** -- text, Markdown, shell
   script (created executable), JSON, CSV. A new item arrives selected with its
   name ready to type.
@@ -98,7 +103,10 @@ because it rules things out:
   moves run off the main thread behind a progress sheet.
 - **Undo does not unlink.** It puts things back by moving the new copies to the
   Trash, so a mistaken undo is itself recoverable.
-- **Delete means Trash.** There is no hard delete anywhere in the app.
+- **Delete means Trash**, and that is what Delete does. Permanent deletion
+  exists in exactly two places, both deliberate and both asking first: Empty
+  Recycle Bin, and Shift-Delete (Cmd Shift Delete), which is Windows' own
+  gesture for it. Nothing else in the app can destroy a file.
 - **The folders macOS manages cannot be renamed, moved or trashed.** Desktop,
   Documents, Downloads, Library and the rest, plus volume roots, items locked
   in Get Info, and anything whose enclosing folder is read-only. Rename, Cut
