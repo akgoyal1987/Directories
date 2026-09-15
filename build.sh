@@ -34,8 +34,8 @@ cat > "${OUT}/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>${NAME}</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.2.1</string>
-    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleShortVersionString</key><string>0.3.0</string>
+    <key>CFBundleVersion</key><string>4</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSMinimumSystemVersion</key><string>${MIN_MACOS}</string>
     <key>NSHumanReadableCopyright</key><string>MIT licensed</string>

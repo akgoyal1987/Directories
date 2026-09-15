@@ -23,6 +23,12 @@ Explorer and keep reaching for a pane that is not there, this is that pane.
   `~` expands, Escape reverts, and clicking away puts the breadcrumbs back.
 - **Go menu** for Home, Computer, Applications and Utilities, plus Enclosing
   Folder, Show Location in Finder and Copy Location.
+- **Recycle Bin** in Locations, which is the real `~/.Trash`. Browsing only:
+  there is deliberately no Empty Trash, because every delete in this app moves
+  to the Trash so that it can be undone, and an Empty command would be the one
+  place that destroys something for good. macOS guards `~/.Trash` behind Full
+  Disk Access and never prompts for it, so until that is granted the folder
+  reads as empty -- the app says so rather than showing you an empty bin.
 
 **Viewing**
 

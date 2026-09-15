@@ -657,6 +657,14 @@ final class AppState: ObservableObject {
     @Published var activeNode: UUID?
     private var activeRoot: FileNode?
 
+    /// True when the folder listed as empty because macOS refused the read, not
+    /// because it holds nothing. The Recycle Bin is the case that matters:
+    /// `~/.Trash` needs Full Disk Access and, unlike Desktop or Documents, macOS
+    /// never prompts for it -- the read just returns nothing. Without this an
+    /// empty bin and an unreadable one look identical, and the honest answer is
+    /// the difference between a broken feature and a permission to grant.
+    @Published var accessDenied = false
+
     @Published var addressText = ""
     @Published var focusAddress = false
     @Published var renaming: URL?
@@ -832,6 +840,18 @@ final class AppState: ObservableObject {
             at: URL(fileURLWithPath: "/Volumes"), includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles])) ?? []
         locs.append(contentsOf: volumes.filter(FS.isNavigableDirectory).map { FileNode(url: $0) })
+
+        // The Recycle Bin, last in Locations as it is in Explorer. It is the
+        // real ~/.Trash, so what shows here is what the Finder shows.
+        //
+        // Browsing only: there is deliberately no Empty Trash. Every delete in
+        // this app moves to the Trash precisely so it can be undone, and an
+        // Empty command would be the one place that destroys something for
+        // good. The Finder already has it for anyone who wants it.
+        let trash = home.appendingPathComponent(".Trash")
+        if FileManager.default.fileExists(atPath: trash.path) {
+            locs.append(FileNode(url: trash, label: "Recycle Bin"))
+        }
         locations = locs
     }
 
@@ -844,6 +864,9 @@ final class AppState: ObservableObject {
         guard let folder else { return }
         allRows = readEntries(folder, showHidden: showHidden, posix: needsPOSIX)
         recomputeRows()
+        // Only for an empty listing, so the common path pays nothing.
+        accessDenied = allRows.isEmpty
+            && (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) == nil
         selected = []
         selectionAnchor = nil
         addressText = folder.path
@@ -889,6 +912,9 @@ final class AppState: ObservableObject {
         let keep = selected
         allRows = readEntries(folder, showHidden: showHidden, posix: needsPOSIX)
         recomputeRows()
+        // Only for an empty listing, so the common path pays nothing.
+        accessDenied = allRows.isEmpty
+            && (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) == nil
         let live = Set(allRows.map(\.url))
         selected = keep.intersection(live)
         if let anchor = selectionAnchor, !live.contains(anchor) { selectionAnchor = nil }
@@ -1571,6 +1597,9 @@ struct ResizeHandle: View {
 }
 
 struct HeaderCell: View {
+    /// Shared with `ListRow` so the header and the rows shrink in step.
+    static let minimumNameWidth: CGFloat = 140
+
     let field: SortField
     let width: CGFloat?
     let trailing: Bool
@@ -1586,7 +1615,13 @@ struct HeaderCell: View {
             }
             if !trailing { Spacer(minLength: 0) }
         }
-        .frame(maxWidth: width == nil ? .infinity : nil, alignment: trailing ? .trailing : .leading)
+        // The name column is the flexible one, so it absorbs every bit of
+        // squeeze when the fixed columns are wider than the window. Without a
+        // floor it collapses to nothing and the list shows icons, sizes and
+        // dates with no names at all -- see the note on ListRow.
+        .frame(minWidth: width == nil ? Self.minimumNameWidth : nil,
+               maxWidth: width == nil ? .infinity : nil,
+               alignment: trailing ? .trailing : .leading)
         .frame(width: width, alignment: trailing ? .trailing : .leading)
         .foregroundStyle(state.sortField == field ? Color.primary : Color.secondary)
         .contentShape(Rectangle())
@@ -1760,7 +1795,17 @@ struct ListRow: View {
                         .onTapGesture { nameTapped() }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            // A floor under the name.
+            //
+            // The name is the only flexible child of the row, so when the
+            // chosen columns are together wider than the window, SwiftUI takes
+            // the whole difference out of this one view and squeezes it to zero
+            // -- a list of icons, sizes and dates with no names, which is what
+            // it did after a few columns were widened and the window was made
+            // narrower. Explorer keeps the name and lets the columns to its
+            // right run off the edge instead, which is the right trade: the
+            // name is the thing you are reading.
+            .frame(minWidth: HeaderCell.minimumNameWidth, maxWidth: .infinity, alignment: .leading)
 
             ForEach(state.columns, id: \.self) { column in
                 Spacer().frame(width: 9)      // matches the header's resize handle
@@ -2387,10 +2432,27 @@ struct ContentView: View {
     /// An empty folder is exactly where the background menu matters most, so
     /// this carries its own copy rather than relying on the pane's.
     private var emptyState: some View {
-        VStack {
+        VStack(spacing: 10) {
             Spacer()
-            Text(state.filter.isEmpty ? "This folder is empty" : "No items match \"\(state.filter)\"")
-                .foregroundStyle(.secondary).font(.system(size: 13))
+            if state.accessDenied {
+                Text("macOS will not let Directories read this folder")
+                    .foregroundStyle(.secondary).font(.system(size: 13))
+                Text("The Recycle Bin and a few other locations need Full Disk "
+                     + "Access. macOS never asks for it, so it has to be granted "
+                     + "by hand -- until it is, they look empty rather than "
+                     + "refused.")
+                    .foregroundStyle(.secondary).font(.system(size: 11))
+                    .multilineTextAlignment(.center).frame(maxWidth: 360)
+                Button("Open Full Disk Access Settings") {
+                    let url = URL(string: "x-apple.systempreferences:com.apple.preference."
+                                  + "security?Privacy_AllFiles")!
+                    NSWorkspace.shared.open(url)
+                }
+                .font(.system(size: 11))
+            } else {
+                Text(state.filter.isEmpty ? "This folder is empty" : "No items match \"\(state.filter)\"")
+                    .foregroundStyle(.secondary).font(.system(size: 13))
+            }
             Spacer()
         }
         .frame(maxWidth: .infinity, minHeight: 220)
